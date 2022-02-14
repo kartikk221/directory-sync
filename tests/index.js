@@ -6,7 +6,7 @@ const TestServer = new DirectorySync.Server({
 
 (async () => {
     await TestServer.host('source', './source');
-    console.log(TestServer.hosts);
     console.log(TestServer.hosts['source'].map.directories);
     console.log(TestServer.hosts['source'].map.files);
+    console.log(TestServer.hosts['source'].map.schema);
 })();

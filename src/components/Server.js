@@ -37,6 +37,17 @@ class Server extends EventEmitter {
     }
 
     /**
+     * Emits a 'log' event with the specified code/message.
+     *
+     * @private
+     * @param {String} code
+     * @param {String} message
+     */
+    _log(code, message) {
+        this.emit('log', code, message);
+    }
+
+    /**
      * Initializes the underlying HyperExpress webserver to power this server instance.
      * @private
      */
@@ -60,19 +71,51 @@ class Server extends EventEmitter {
 
         // Bind server global uncaught error handler to emitter
         const reference = this;
-        this.#server.set_error_handler((_, response, error) => {
-            reference.emit('error', error);
+        this.#server.set_error_handler((request, response, error) => {
+            reference.emit('error', error, request);
             return response.status(500).json({
                 code: 'UNCAUGHT_ERROR',
                 message: 'An uncaught error occured while processing your request.',
             });
         });
 
+        // Bind the appropriate communication routes
+        this._bind_http_route();
+
         // Listen on specified user port
         this.#server
             .listen(port)
             .then(() => this.emit('log', 'STARTUP', `Server started on port ${port}`))
             .catch((error) => this.emit('error', error));
+    }
+
+    /**
+     * Binds the master HTTP route which will handle all incoming communications.
+     * @private
+     */
+    _bind_http_route() {
+        // Create the global catch-all HTTP route
+        this.#server.any('/', (request, response) => {
+            // Destructure various path/query parameters
+            const { host, uri } = request.query_parameters;
+
+            // Ensure that the incoming request maps to a valid host
+            if (typeof host !== 'string' || this.#hosts[host] == undefined)
+                return response.status(404).json({
+                    code: 'INVALID_HOST',
+                    message: `The specified host '${typeof host == 'string' ? host : ''}' is invalid.`,
+                });
+
+            if (uri === undefined)
+                switch (request.method) {
+                    case 'GET':
+                        break;
+                    case 'POST':
+                        break;
+                    case 'DELETE':
+                        break;
+                }
+        });
     }
 
     /**

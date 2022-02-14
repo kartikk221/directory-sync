@@ -26,6 +26,6 @@
     "homepage": "https://github.com/kartikk221/directory-sync#readme",
     "dependencies": {
         "chokidar": "^3.5.3",
-        "hyper-express": "^5.6.0"
+        "hyper-express": "^5.7.0"
     }
 }

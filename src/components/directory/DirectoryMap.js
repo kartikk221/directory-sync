@@ -276,7 +276,8 @@ class DirectoryMap extends EventEmitter {
         // Retrieve the relative path to the directory
         const object = this._object_stats(path, stats);
         if (object) {
-            // Store the object by the relative path aka uri
+            // Expire schema & store the object by the relative path aka uri
+            this.#schema = null;
             this.#directories[object.uri] = object;
 
             // Emit the directory create event
@@ -294,7 +295,8 @@ class DirectoryMap extends EventEmitter {
         // Retrieve the relative path to the directory
         const relative_path = this._relative_path(path);
 
-        // Delete the directory's record from the directory map
+        // Expire schema & delete the directory's record from the directory map
+        this.#schema = null;
         delete this.#directories[relative_path];
 
         // Emit the directory delete event for a higher consumer
@@ -313,7 +315,8 @@ class DirectoryMap extends EventEmitter {
         // Retrieve the relative path to the directory
         const object = this._object_stats(path, stats);
         if (object) {
-            // Store the object by the relative path aka uri
+            // Expire schema & store the object by the relative path aka uri
+            this.#schema = null;
             this.#files[object.uri] = object;
 
             // Emit the directory create event
@@ -331,7 +334,8 @@ class DirectoryMap extends EventEmitter {
         // Retrieve the relative path to the directory
         const relative_path = this._relative_path(path);
 
-        // Delete the file's record from the directory map
+        // Expire schema & delete the file's record from the directory map
+        this.#schema = null;
         delete this.#files[relative_path];
 
         // Emit the file delete event for a higher consumer
@@ -358,6 +362,47 @@ class DirectoryMap extends EventEmitter {
      */
     get path() {
         return this.#path;
+    }
+
+    #schema;
+
+    /**
+     * Returns a stringified JSON representation of this DirectoryMap as a schematic.
+     * All candidates are sorted in increasing url parts.
+     * Directories come first, files come second.
+     * Directory Structure -> [uri: string]: [created_at: number, updated_at: number]
+     * File Structure -> [uri: string]: [size: number, created_at: number, updated_at: number]
+     * Note! Directories do NOT have a size property at index 0.
+     *
+     * @returns {Object<string, Array<string>>}
+     */
+    get schema() {
+        // Resolve from local cache if available
+        if (this.#schema) return this.#schema;
+
+        // Build a new schema based on latest available directory/file candidates
+        const schema = {};
+        [this.#directories, this.#files].forEach((records, index) => {
+            Object.keys(records)
+                .sort((left, right) => {
+                    // Sort the records in increasing url parts for hierarchy purposes
+                    const leftParts = left.split('/');
+                    const rightParts = right.split('/');
+                    return leftParts.length - rightParts.length;
+                })
+                .forEach((uri) => {
+                    // Convert each record into a simplified array
+                    const record = records[uri];
+                    const { size, created_at, modified_at } = record.stats;
+
+                    // Only include the size property for FILES only
+                    schema[uri] = index == 0 ? [created_at, modified_at] : [size, created_at, modified_at];
+                });
+        });
+
+        // Cache and resolve the newly built schema
+        this.#schema = schema;
+        return this.#schema;
     }
 
     /**
