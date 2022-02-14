@@ -1,7 +1,5 @@
-const Source = require('./src/components/Source');
-const Editor = require('./src/components/Editor');
+const Server = require('./src/components/Server.js');
 
 module.exports = {
-    Source,
-    Editor,
+    Server,
 };

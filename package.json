@@ -25,10 +25,7 @@
     },
     "homepage": "https://github.com/kartikk221/directory-sync#readme",
     "dependencies": {
-        "etag": "^1.8.1",
-        "fetch-easy": "^1.0.0",
-        "hyper-express": "^3.2.1",
-        "just-queue": "^1.0.1",
-        "live-directory": "^2.3.0"
+        "chokidar": "^3.5.3",
+        "hyper-express": "^5.6.0"
     }
 }
