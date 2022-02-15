@@ -148,6 +148,16 @@ class DirectoryMap extends EventEmitter {
     }
 
     /**
+     * Returns the associated map record for the specified uri if it exists.
+     *
+     * @param {String} uri
+     * @returns {MapRecord=}
+     */
+    get(uri) {
+        return this.#directories[uri] || this.#files[uri];
+    }
+
+    /**
      * Initializes the underlying watcher instance that will power this directory tree.
      * @private
      */

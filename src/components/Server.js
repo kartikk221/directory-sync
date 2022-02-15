@@ -1,4 +1,5 @@
 const Path = require('path');
+const Stream = require('stream');
 const EventEmitter = require('events');
 const HyperExpress = require('hyper-express');
 const DirectoryMap = require('./directory/DirectoryMap.js');
@@ -106,15 +107,71 @@ class Server extends EventEmitter {
                     message: `The specified host '${typeof host == 'string' ? host : ''}' is invalid.`,
                 });
 
-            if (uri === undefined)
-                switch (request.method) {
-                    case 'GET':
-                        break;
-                    case 'POST':
-                        break;
-                    case 'DELETE':
-                        break;
+            // Return the schema of the map for this host if no uri is provided
+            const { manager, map } = this.#hosts[host];
+            if (uri === undefined) return response.json(map.schema);
+
+            // If uri is provided, ensure it is a valid string
+            if (typeof uri !== 'string' || uri.length == 0)
+                return response.status(400).json({
+                    code: 'INVALID_URI',
+                    message: "Query parameter 'uri' must be a valid string.",
+                });
+
+            // Retrieve the associated map record for the provided uri
+            const record = map.get(uri);
+            if (record === undefined)
+                return response.status(404).json({
+                    code: 'NOT_FOUND',
+                    message: 'No record exists for the specified uri.',
+                });
+
+            // Match the incoming request to one of the supported operations
+            let operation;
+            switch (request.method) {
+                case 'GET':
+                    operation = manager.read(uri);
+                    break;
+                case 'POST':
+                    operation = manager.write(uri, request.stream);
+                    break;
+                case 'DELETE':
+                    operation = manager.delete(uri);
+                    break;
+            }
+
+            // Determine if we were able to successfully map the request to an operation
+            if (operation) {
+                // Safely retrieve the output from the operation
+                let output;
+                try {
+                    output = await operation;
+                } catch (error) {
+                    // Return the request with the error message
+                    return response.status(500).json({
+                        code: 'INTERNAL_ERROR',
+                        message: 'An uncaught error DirectoryManager error occured.',
+                        error: error?.message,
+                    });
                 }
+
+                // If the output of the operation is a readable stream, pipe it to the requester
+                if (output instanceof Stream.Readable) {
+                    return output.pipe(response.writable);
+                } else {
+                    // Send a 'SUCCESS' code response with any output as that data
+                    return response.json({
+                        code: 'SUCCESS',
+                        data: output,
+                    });
+                }
+            } else {
+                // The request was an unsupported HTTP method
+                return response.status(405).json({
+                    code: 'UNSUPPORTED_METHOD',
+                    message: `The HTTP method '${request.method}' is not supported.`,
+                });
+            }
         });
     }
 
