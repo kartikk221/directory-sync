@@ -1,13 +1,13 @@
-const Path = require('path');
-const Stream = require('stream');
-const EventEmitter = require('events');
-const HyperExpress = require('hyper-express');
-const DirectoryMap = require('./directory/DirectoryMap.js');
-const DirectoryManager = require('./directory/DirectoryManager.js');
+import Path from 'path';
+import Stream from 'stream';
+import EventEmitter from 'events';
+import HyperExpress from 'hyper-express';
+import DirectoryMap from './directory/DirectoryMap.js';
+import DirectoryManager from './directory/DirectoryManager.js';
 
-const { wrap_object, is_accessible_path, to_forward_slashes } = require('../utils/operators.js');
+import { wrap_object, is_accessible_path, to_forward_slashes } from '../utils/operators.js';
 
-class Server extends EventEmitter {
+export default class Server extends EventEmitter {
     #server;
     #hosts = {};
     #options = {
@@ -127,7 +127,11 @@ class Server extends EventEmitter {
         // Create the global catch-all HTTP route
         this.#server.any('/', async (request, response) => {
             // Destructure various path/query parameters
-            const { host, uri } = request.query_parameters;
+            let { host, uri } = request.query_parameters;
+
+            // Decode the host/uri url encoded components
+            host = decodeURIComponent(host);
+            if (uri) uri = decodeURIComponent(uri);
 
             // Ensure that the incoming request maps to a valid host
             if (typeof host !== 'string' || this.#hosts[host] == undefined)
@@ -138,7 +142,11 @@ class Server extends EventEmitter {
 
             // Return the schema of the map for this host if no uri is provided
             const { manager, map } = this.#hosts[host];
-            if (uri === undefined) return response.json(map.schema);
+            if (uri === undefined)
+                return response.json({
+                    options: map.options,
+                    schema: map.schema,
+                });
 
             // If uri is provided, ensure it is a valid string
             if (typeof uri !== 'string' || uri.length == 0)
@@ -264,5 +272,3 @@ class Server extends EventEmitter {
         return this.#options;
     }
 }
-
-module.exports = Server;

@@ -1,5 +1,5 @@
-const FileSystem = require('fs');
-const AsyncFileSystem = require('fs/promises');
+import FileSystem from 'fs';
+import AsyncFileSystem from 'fs/promises';
 
 /**
  * Writes values from focus object onto base object.
@@ -81,11 +81,4 @@ async function is_accessible_path(path) {
     return true;
 }
 
-module.exports = {
-    wrap_object,
-    async_wait,
-    async_for_each,
-    match_extension,
-    to_forward_slashes,
-    is_accessible_path,
-};
+export { wrap_object, async_wait, async_for_each, match_extension, to_forward_slashes, is_accessible_path };

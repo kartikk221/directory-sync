@@ -3,6 +3,7 @@
     "version": "1.0.0",
     "description": "Easily synchronize directories between two machines over the internet.",
     "main": "index.js",
+    "type": "module",
     "scripts": {
         "test": "echo \"Error: no test specified\" && exit 1"
     },

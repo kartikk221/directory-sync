@@ -1,4 +1,4 @@
-const DirectorySync = require('../index.js');
+import * as DirectorySync from '../index.js';
 
 const TestServer = new DirectorySync.Server({
     port: 8080,
@@ -9,11 +9,27 @@ const TestServer = new DirectorySync.Server({
     },
 });
 
-const TestMirror = new DirectorySync.Mirror('source', {
-    path: './mirrored',
-    port: 8080,
-});
+// Bind appropriate listeners to Server
+TestServer.on('log', (code, message) => console.log(`[SERVER] ${code} -> ${message}`));
+TestServer.on('error', (error) => console.log(`[SERVER]`, error));
 
 (async () => {
+    // Initialize server host
     await TestServer.host('source', './source');
+
+    // Initialize a mirror
+    const TestMirror = new DirectorySync.Mirror('source', {
+        path: './mirrored',
+        hostname: 'localhost',
+        port: 8080,
+        auth: {
+            headers: {
+                'x-key': 'development',
+            },
+        },
+    });
+
+    // Bind appropriate listeners to Mirror
+    TestMirror.on('log', (code, message) => console.log(`[MIRROR] ${code} -> ${message}`));
+    TestMirror.on('error', (error) => console.log(`[MIRROR]`, error));
 })();

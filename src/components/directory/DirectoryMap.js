@@ -1,8 +1,9 @@
-const Path = require('path');
-const Chokidar = require('chokidar');
-const EventEmitter = require('events');
-const FileSystem = require('fs');
-const { wrap_object, match_extension, to_forward_slashes, is_accessible_path } = require('../../utils/operators.js');
+import Path from 'path';
+import Chokidar from 'chokidar';
+import EventEmitter from 'events';
+import FileSystem from 'fs';
+
+import { wrap_object, match_extension, to_forward_slashes, is_accessible_path } from '../../utils/operators.js';
 
 /**
  * @typedef {Object} FilteringObject
@@ -30,7 +31,7 @@ const { wrap_object, match_extension, to_forward_slashes, is_accessible_path } =
  * @property {FileSystem.Stats} stats
  */
 
-class DirectoryMap extends EventEmitter {
+export default class DirectoryMap extends EventEmitter {
     #path;
     #watcher;
     #files = {};
@@ -69,6 +70,7 @@ class DirectoryMap extends EventEmitter {
         options.path = to_forward_slashes(Path.resolve(options.path));
         wrap_object(this.#options, options);
         this.#path = options.path;
+        delete this.#options.path;
 
         // Parse the "keep" and "ignore" filter functions into usable functions
         const reference = this;
@@ -129,21 +131,14 @@ class DirectoryMap extends EventEmitter {
         this._initialize_watcher().catch((error) => this.emit('error', error));
     }
 
-    #ready_promise;
     #ready_resolve;
+    #ready_promise = new Promise((resolve) => (this.#ready_resolve = resolve));
 
     /**
      * Returns a Promise which is resolved once this DirecotryTree instance is ready to be used.
      * @returns {Promise<void>}
      */
     ready() {
-        // Return the cached promise if available
-        if (this.#ready_promise) return this.#ready_promise;
-
-        // Create a new promise for consuming the 'ready' event from watcher
-        this.#ready_promise = new Promise((resolve) => (this.#ready_resolve = resolve));
-
-        // Return this promise for the current user
         return this.#ready_promise;
     }
 
@@ -163,7 +158,8 @@ class DirectoryMap extends EventEmitter {
      */
     async _initialize_watcher() {
         // Retrieve the root path from user options
-        const { path, watcher } = this.#options;
+        const path = this.#path;
+        const { watcher } = this.#options;
 
         // Ensure the provided root path is accessible
         if (!(await is_accessible_path(path)))
@@ -202,7 +198,7 @@ class DirectoryMap extends EventEmitter {
         this.#watcher.on('add', (path, stats) => this._on_file_add(path, stats));
         this.#watcher.on('unlink', (path) => this._on_file_delete(path));
         this.#watcher.on('change', (path, stats) => this._on_file_change(path, stats));
-        this.#watcher.on('ready', () => (this.#ready_resolve ? this.#ready_resolve() : undefined));
+        this.#watcher.on('ready', () => this.#ready_resolve());
 
         // Bind a global close handler to close the chokidar instance
         // This will prevent the watcher from hanging on to the process
@@ -220,7 +216,7 @@ class DirectoryMap extends EventEmitter {
      */
     _relative_path(path) {
         // Retrieve the relative path by removing the root path from the provided path
-        return to_forward_slashes(path).replace(this.#options.path, '');
+        return to_forward_slashes(path).replace(this.#path, '');
     }
 
     /**
@@ -447,5 +443,3 @@ class DirectoryMap extends EventEmitter {
         return this.#files;
     }
 }
-
-module.exports = DirectoryMap;

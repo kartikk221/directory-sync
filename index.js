@@ -1,7 +1,4 @@
-const Server = require('./src/components/Server.js');
-const Mirror = require('./src/components/Mirror.js');
+import Server from './src/components/Server.js';
+import Mirror from './src/components/Mirror.js';
 
-module.exports = {
-    Server,
-    Mirror,
-};
+export { Server, Mirror };

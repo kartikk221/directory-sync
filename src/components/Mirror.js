@@ -1,13 +1,14 @@
-const fetch = require('node-fetch');
-const Path = require('path');
-const Stream = require('stream');
-const FileSystem = require('fs/promises');
-const EventEmitter = require('events');
-const DirectoryMap = require('./directory/DirectoryMap.js');
+import fetch from 'node-fetch';
+import Path from 'path';
+import Stream from 'stream';
+import FileSystem from 'fs/promises';
+import EventEmitter from 'events';
+import DirectoryMap from './directory/DirectoryMap.js';
+import DirectoryManager from './directory/DirectoryManager.js';
 
-const { wrap_object, to_forward_slashes } = require('../utils/operators');
+import { wrap_object, to_forward_slashes, is_accessible_path, async_for_each } from '../utils/operators.js';
 
-class Mirror extends EventEmitter {
+export default class Mirror extends EventEmitter {
     #ws;
     #map;
     #manager;
@@ -41,6 +42,19 @@ class Mirror extends EventEmitter {
     }
 
     /**
+     * Compares the provided local file record against remote file record to determine if local record is expired.
+     *
+     * @param {import('./directory/DirectoryMap.js').MapRecord} local
+     * @param {import('./directory/DirectoryMap.js').MapRecord} remote
+     * @returns
+     */
+    _is_file_expired(local, remote) {
+        const [l_size, l_cat, l_mat] = local;
+        const [r_size, r_cat, r_mat] = remote;
+        return l_cat < r_cat || l_mat < r_mat || l_size !== r_size;
+    }
+
+    /**
      * Performs initial contents sync with remote server.
      * @private
      */
@@ -52,24 +66,32 @@ class Mirror extends EventEmitter {
         // Create the directory at path if not specified
         if (!(await is_accessible_path(path))) await FileSystem.mkdir(path);
 
-        // Create a new DirectoryMap instance for this mirror
-        options.path = path;
+        // Retrieve remote host map options and schema
+        const response = await this._http_request('GET');
+        const { options, schema } = await response.json();
+
+        // Initialize a DirectoryMap locally to compare with remote
+        options.path = this.#options.path;
         this.#map = new DirectoryMap(options);
         this.#manager = new DirectoryManager(this.#map);
 
-        // Bind a error handler to pass through any errors
-        map.on('error', (error) => this.emit('error', error));
+        // Wait for the map to be ready before performing synchronization
+        await this.#map.ready();
 
-        // Wait for the DirectoryMap to be ready
-        await map.ready();
+        // Perform synchronization of directories/files with remote schema
+        const promises = [];
+        const reference = this;
+        await async_for_each(Object.keys(schema), async (uri) => {
+            // Determine the local and remote schema records
+            const remote_record = schema[uri];
+            const is_directory = remote_record.length === 3; // [SIZE, CREATED_AT, MODIFIED_AT]
+            const local_Record = reference.#map.schema[uri];
 
-        // Make a request to remote server to retrieve schema
-        const local_schema = map.schema;
-        const response = await this._http_request('GET');
-        const remote_schema = await response.json();
-
-        console.log(local_schema);
-        console.log(remote_schema);
+            // Ensure both remote record and local record exist
+            if (remote_record && local_Record) {
+                // Ensure the local file was created/modified at later than remote
+            }
+        });
     }
 
     /**
@@ -98,5 +120,3 @@ class Mirror extends EventEmitter {
         );
     }
 }
-
-module.exports = Mirror;
