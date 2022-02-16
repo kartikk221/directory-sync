@@ -3,6 +3,7 @@ const Stream = require('stream');
 const EventEmitter = require('events');
 const HyperExpress = require('hyper-express');
 const DirectoryMap = require('./directory/DirectoryMap.js');
+const DirectoryManager = require('./directory/DirectoryManager.js');
 
 const { wrap_object, is_accessible_path, to_forward_slashes } = require('../utils/operators.js');
 
@@ -20,7 +21,6 @@ class Server extends EventEmitter {
         },
         auth: {
             headers: null,
-            handler: null,
         },
     };
 
@@ -80,7 +80,8 @@ class Server extends EventEmitter {
             });
         });
 
-        // Bind the appropriate communication routes
+        // Bind the appropriate middlewares & communication routes
+        this._bind_authentication_middleware();
         this._bind_http_route();
 
         // Listen on specified user port
@@ -91,12 +92,40 @@ class Server extends EventEmitter {
     }
 
     /**
+     * Binds global authentication middleware to authenticate all incoming network requests.
+     * @private
+     */
+    _bind_authentication_middleware() {
+        // Bind the global middleware for request authentication
+        const headers = this.#options.auth.headers;
+        this.#server.use((request, response, next) => {
+            // Ensure that the request has all of the required auth headers
+            let is_authenticated = true;
+            if (typeof headers == 'object')
+                Object.keys(headers).forEach((key) => {
+                    const value = headers[key];
+                    if (request.headers[key] !== value) is_authenticated = false;
+                });
+
+            // Process request based on whether request is authenticated
+            if (is_authenticated) {
+                return next();
+            } else {
+                return response.status(403).json({
+                    code: 'UNAUTHORIZED',
+                    message: 'Please provide valid authentication headers.',
+                });
+            }
+        });
+    }
+
+    /**
      * Binds the master HTTP route which will handle all incoming communications.
      * @private
      */
     _bind_http_route() {
         // Create the global catch-all HTTP route
-        this.#server.any('/', (request, response) => {
+        this.#server.any('/', async (request, response) => {
             // Destructure various path/query parameters
             const { host, uri } = request.query_parameters;
 
@@ -196,6 +225,7 @@ class Server extends EventEmitter {
         // Create a new DirectoryMap instance for this host
         options.path = path;
         const map = new DirectoryMap(options);
+        const manager = new DirectoryManager(map);
 
         // Bind a error handler to pass through any errors
         map.on('error', (error) => this.emit('error', error));
@@ -207,6 +237,7 @@ class Server extends EventEmitter {
         this.#hosts[name] = {
             path,
             map,
+            manager,
         };
     }
 
