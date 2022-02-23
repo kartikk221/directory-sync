@@ -167,7 +167,8 @@ export default class Server extends EventEmitter {
             let operation;
             switch (request.method) {
                 case 'GET':
-                    operation = manager.read(uri);
+                    // Retrieve a readable stream for the specified uri
+                    operation = manager.read(uri, true);
                     break;
                 case 'POST':
                     operation = manager.write(uri, request.stream);
@@ -179,10 +180,10 @@ export default class Server extends EventEmitter {
 
             // Determine if we were able to successfully map the request to an operation
             if (operation) {
-                // Safely retrieve the output from the operation
+                // Safely retrieve the output from the operation by awaiting if it is a promise
                 let output;
                 try {
-                    output = await operation;
+                    output = output instanceof Promise ? await operation : operation;
                 } catch (error) {
                     // Return the request with the error message
                     return response.status(500).json({
@@ -192,7 +193,7 @@ export default class Server extends EventEmitter {
                     });
                 }
 
-                // If the output of the operation is a readable stream, pipe it to the requester
+                // If the output of the operation is a readable stream, pipe it as the response
                 if (output instanceof Stream.Readable) {
                     return output.pipe(response.writable);
                 } else {

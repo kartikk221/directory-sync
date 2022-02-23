@@ -21,6 +21,16 @@ export default class Mirror extends EventEmitter {
         auth: {
             headers: null,
         },
+        retries: {
+            http: {
+                max: 3,
+                delay: 1000,
+            },
+            ws: {
+                max: Infinity,
+                delay: 2500,
+            },
+        },
     };
 
     constructor(host, options = this.#options) {
@@ -37,28 +47,26 @@ export default class Mirror extends EventEmitter {
         this.#host = host;
         wrap_object(this.#options, options);
 
-        // Initialize this mirror with remote server
-        this._initial_sync();
+        // Perform a hard sync at the beginning of the instance
+        this._perform_hard_sync();
     }
 
     /**
-     * Compares the provided local file record against remote file record to determine if local record is expired.
+     * Emits a 'log' event with the specified code/message.
      *
-     * @param {import('./directory/DirectoryMap.js').MapRecord} local
-     * @param {import('./directory/DirectoryMap.js').MapRecord} remote
-     * @returns
+     * @private
+     * @param {String} code
+     * @param {String} message
      */
-    _is_file_expired(local, remote) {
-        const [l_size, l_cat, l_mat] = local;
-        const [r_size, r_cat, r_mat] = remote;
-        return l_cat < r_cat || l_mat < r_mat || l_size !== r_size;
+    _log(code, message) {
+        this.emit('log', code, message);
     }
 
     /**
-     * Performs initial contents sync with remote server.
+     * Performs a hard files/directories sync with the remote server.
      * @private
      */
-    async _initial_sync() {
+    async _perform_hard_sync() {
         // Translate the user provided path into an absolute system path
         let { path } = this.#options;
         path = to_forward_slashes(Path.resolve(path));
@@ -67,6 +75,7 @@ export default class Mirror extends EventEmitter {
         if (!(await is_accessible_path(path))) await FileSystem.mkdir(path);
 
         // Retrieve remote host map options and schema
+        const start_time = Date.now();
         const response = await this._http_request('GET');
         const { options, schema } = await response.json();
 
@@ -81,17 +90,62 @@ export default class Mirror extends EventEmitter {
         // Perform synchronization of directories/files with remote schema
         const promises = [];
         const reference = this;
-        await async_for_each(Object.keys(schema), async (uri) => {
+        await async_for_each(Object.keys(schema), async (uri, next) => {
             // Determine the local and remote schema records
             const remote_record = schema[uri];
-            const is_directory = remote_record.length === 3; // [SIZE, CREATED_AT, MODIFIED_AT]
-            const local_Record = reference.#map.schema[uri];
+            const local_record = reference.#map.schema[uri];
+            const is_directory = remote_record.length === 2;
 
-            // Ensure both remote record and local record exist
-            if (remote_record && local_Record) {
-                // Ensure the local file was created/modified at later than remote
+            // Handle case where local remote record is a directory
+            if (is_directory) {
+                // Create the directory if it doesn't exist
+                // We want to await this operation as directories are essential before files can be written
+                if (local_record === undefined) {
+                    await reference.#manager.create(uri, true);
+                    reference._log('CREATE', `${uri} - DIRECTORY`);
+                }
+            } else {
+                // Destructure the remote record into components [SIZE, CREATED_AT, MODIFIED_AT]
+                const [r_size, r_cat, r_mat] = remote_record;
+
+                // Determine the sync direction for this file record
+                let sync_direction = local_record === undefined ? -1 : 0; // -1 = download, 0 = no sync, 1 = upload
+                if (local_record) {
+                    const [l_size, l_cat, l_mat] = local_record;
+
+                    // Determine if local file record is older than remote
+                    if (l_cat < r_cat || l_mat < r_mat) sync_direction = -1;
+                    else if (l_cat > r_cat || l_mat > r_mat) sync_direction = 1;
+                }
+
+                // Perform the file sync operation
+                switch (sync_direction) {
+                    case -1:
+                        // Download the file from remote server
+                        const start_ts = Date.now();
+                        const promise = reference._download_file(uri);
+                        promises.push(promise);
+                        promise.then(() => reference._log('DOWNLOAD', `${uri} - ${Date.now() - start_ts}ms`));
+                        break;
+                }
             }
+
+            // Proceed to next record
+            next();
         });
+
+        // Wait for all promises to resolve
+        if (promises.length > 0) await Promise.all(promises);
+
+        // Emit a completion log
+        this._log('COMPLETE', `HARD_SYNC - ${Date.now() - start_time}ms`);
+    }
+
+    /**
+     * Creates a websocket connection to the remote server.
+     */
+    _create_ws_connection() {
+        // Create websocket connection here
     }
 
     /**
@@ -118,5 +172,22 @@ export default class Mirror extends EventEmitter {
                 body,
             }
         );
+    }
+
+    /**
+     * Returns a readable stream for a file from the remote server.
+     *
+     * @param {String} uri
+     * @returns {Promise<Stream.Readable>}
+     */
+    async _download_file(uri) {
+        // Make the HTTP request to retrieve the file stream
+        const { status, body } = await this._http_request('GET', uri);
+
+        // Ensure the response status code is valid
+        if (status !== 200) throw new Error(`_download_file(${uri}) -> HTTP ${status}`);
+
+        // Write the file stream to local directory
+        return await this.#manager.write(uri, body);
     }
 }
