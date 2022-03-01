@@ -36,6 +36,7 @@ export default class DirectoryMap extends EventEmitter {
     #watcher;
     #files = {};
     #directories = {};
+    #supressions = {};
     #options = {
         path: '',
         filters: {
@@ -43,6 +44,7 @@ export default class DirectoryMap extends EventEmitter {
             ignore: {},
         },
         watcher: {
+            usePolling: true,
             awaitWriteFinish: {
                 pollInterval: 100,
                 stabilityThreshold: 500,
@@ -153,6 +155,45 @@ export default class DirectoryMap extends EventEmitter {
     }
 
     /**
+     * Supresses a future event from being emitted on a uri.
+     *
+     * @param {String} uri
+     * @param {String} event
+     * @param {Number} amount
+     * @returns {Number} The amount of supressions for this uri/event.
+     */
+    supress(uri, event, amount = 1) {
+        // Initialize the supression key or increment the amount of supressions
+        const key = `${event}:${uri}`;
+        if (!this.#supressions[key]) {
+            this.#supressions[key] = amount;
+        } else {
+            this.#supressions[key] += amount;
+        }
+        return this.#supressions[key];
+    }
+
+    /**
+     * Depresses a supressed event from being emitted on a uri.
+     *
+     * @private
+     * @param {String} uri
+     * @param {String} event
+     * @param {Number} amount
+     * @returns {Boolean} Whether the event was successfully de-pressed
+     */
+    _depress(uri, event, amount = 1) {
+        // Decrement the amount of supressions and delete if it is less than 1
+        const key = `${event}:${uri}`;
+        if (this.#supressions[key]) {
+            this.#supressions[key] -= amount;
+            if (this.#supressions[key] < 1) delete this.#supressions[key];
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * Initializes the underlying watcher instance that will power this directory tree.
      * @private
      */
@@ -176,7 +217,7 @@ export default class DirectoryMap extends EventEmitter {
             if (path === reference.#path) return false;
 
             // Extrapolate the relative path for filtering this file/directory
-            const relative = reference._relative_path(path);
+            const relative = reference._relative_uri(path);
 
             // Assert the "ignore" filter as strict if one is available
             // The "ignore" filter is applied first as it is more restrictive
@@ -214,7 +255,7 @@ export default class DirectoryMap extends EventEmitter {
      * @param {String} path
      * @returns {String}
      */
-    _relative_path(path) {
+    _relative_uri(path) {
         // Retrieve the relative path by removing the root path from the provided path
         return to_forward_slashes(path).replace(this.#path, '');
     }
@@ -258,14 +299,14 @@ export default class DirectoryMap extends EventEmitter {
      */
     _object_stats(path, stats) {
         // Retrieve the relative path to the directory
-        const relative_path = this._relative_path(path);
+        const relative_uri = this._relative_uri(path);
 
         // Ignore the root directory from being stored in directories map
-        if (relative_path.length == 0) return;
+        if (relative_uri.length == 0) return;
 
         // Return the formated object stats
         return {
-            uri: relative_path,
+            uri: relative_uri,
             path: to_forward_slashes(path),
             stats: this._filtered_stats(stats),
         };
@@ -286,8 +327,8 @@ export default class DirectoryMap extends EventEmitter {
             this.#schema = null;
             this.#directories[object.uri] = object;
 
-            // Emit the directory create event
-            this.emit('directory_create', object.uri, object);
+            // Emit the directory create event if it is not supressed
+            if (!this._depress(object.uri, 'directory_create', 1)) this.emit('directory_create', object.uri, object);
         }
     }
 
@@ -299,14 +340,14 @@ export default class DirectoryMap extends EventEmitter {
      */
     _on_directory_delete(path) {
         // Retrieve the relative path to the directory
-        const relative_path = this._relative_path(path);
+        const relative_uri = this._relative_uri(path);
 
         // Expire schema & delete the directory's record from the directory map
         this.#schema = null;
-        delete this.#directories[relative_path];
+        delete this.#directories[relative_uri];
 
-        // Emit the directory delete event for a higher consumer
-        this.emit('directory_delete', relative_path);
+        // Emit the directory delete event if it is not supressed
+        if (!this._depress(relative_uri, 'directory_delete', 1)) this.emit('directory_delete', relative_uri);
     }
 
     /**
@@ -325,8 +366,9 @@ export default class DirectoryMap extends EventEmitter {
             this.#schema = null;
             this.#files[object.uri] = object;
 
-            // Emit the directory create event
-            this.emit(is_change ? 'file_change' : 'file_add', object.uri, object);
+            // Emit the file add or change event if it is not supressed
+            const event = is_change ? 'file_change' : 'file_create';
+            if (!this._depress(object.uri, event, 1)) this.emit(event, object.uri, object);
         }
     }
 
@@ -338,14 +380,14 @@ export default class DirectoryMap extends EventEmitter {
      */
     _on_file_delete(path) {
         // Retrieve the relative path to the directory
-        const relative_path = this._relative_path(path);
+        const relative_uri = this._relative_uri(path);
 
         // Expire schema & delete the file's record from the directory map
         this.#schema = null;
-        delete this.#files[relative_path];
+        delete this.#files[relative_uri];
 
-        // Emit the file delete event for a higher consumer
-        this.emit('file_delete', relative_path);
+        // Emit the file delete event if it is not supressed
+        if (!this._depress(relative_uri, 'file_delete', 1)) this.emit('file_delete', relative_uri);
     }
 
     /**
@@ -441,5 +483,13 @@ export default class DirectoryMap extends EventEmitter {
      */
     get files() {
         return this.#files;
+    }
+
+    /**
+     * Returns all the supressed events in this DirectoryMap.
+     * @returns {Object}
+     */
+    get supressions() {
+        return this.#supressions;
     }
 }

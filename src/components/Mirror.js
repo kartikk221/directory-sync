@@ -6,7 +6,7 @@ import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
 
-import { wrap_object, to_forward_slashes, is_accessible_path, async_for_each } from '../utils/operators.js';
+import { wrap_object, to_forward_slashes, is_accessible_path, async_for_each, async_wait } from '../utils/operators.js';
 
 export default class Mirror extends EventEmitter {
     #ws;
@@ -23,7 +23,7 @@ export default class Mirror extends EventEmitter {
         },
         retries: {
             http: {
-                max: 3,
+                max: 5,
                 delay: 1000,
             },
             ws: {
@@ -47,8 +47,8 @@ export default class Mirror extends EventEmitter {
         this.#host = host;
         wrap_object(this.#options, options);
 
-        // Perform a hard sync at the beginning of the instance
-        this._perform_hard_sync();
+        // Initialize local actors
+        this._initialize_actors();
     }
 
     /**
@@ -63,10 +63,10 @@ export default class Mirror extends EventEmitter {
     }
 
     /**
-     * Performs a hard files/directories sync with the remote server.
+     * Initialize the DirectoryMap and DirectoryManager instances.
      * @private
      */
-    async _perform_hard_sync() {
+    async _initialize_actors() {
         // Translate the user provided path into an absolute system path
         let { path } = this.#options;
         path = to_forward_slashes(Path.resolve(path));
@@ -75,7 +75,6 @@ export default class Mirror extends EventEmitter {
         if (!(await is_accessible_path(path))) await FileSystem.mkdir(path);
 
         // Retrieve remote host map options and schema
-        const start_time = Date.now();
         const response = await this._http_request('GET');
         const { options, schema } = await response.json();
 
@@ -86,6 +85,89 @@ export default class Mirror extends EventEmitter {
 
         // Wait for the map to be ready before performing synchronization
         await this.#map.ready();
+
+        // Perform a hard sync to ensure all files/directories are in sync
+        await this._perform_hard_sync(schema);
+
+        // Bind mutation listeners to the DirectoryMap
+        this._bind_mutation_listeners();
+    }
+
+    /**
+     * Binds listeners to all DirectoryMap events for mutating changes to remote.
+     * @private
+     */
+    _bind_mutation_listeners() {
+        const reference = this;
+
+        // Bind a listener for 'directory_create' events
+        this.#map.on('directory_create', async (uri, { stats }) => {
+            // Make an HTTP request to create the directory on the remote server
+            const start_time = Date.now();
+            await reference._http_request('PUT', uri, {}, JSON.stringify([stats.created_at, stats.modified_at]));
+            reference._log('CREATE', `${uri} - DIRECTORY - ${Date.now() - start_time}ms`);
+        });
+
+        // Bind a listener for 'directory_delete' events
+        this.#map.on('directory_delete', async (uri) => {
+            // Make an HTTP request to delete the directory on the remote server
+            const start_time = Date.now();
+            await reference._http_request('DELETE', uri);
+            reference._log('DELETE', `${uri} - DIRECTORY - ${Date.now() - start_time}ms`);
+        });
+
+        // Bind a listener for 'file_create' events
+        this.#map.on('file_create', async (uri, { stats }) => {
+            // Make an HTTP request to create the directory on the remote server
+            const start_time = Date.now();
+            await reference._http_request(
+                'PUT',
+                uri,
+                {},
+                JSON.stringify([stats.size, stats.created_at, stats.modified_at])
+            );
+            reference._log('CREATE', `${uri} - FILE - ${Date.now() - start_time}ms`);
+        });
+
+        // Bind a listener for 'file_change' events
+        this.#map.on('file_change', async (uri, { stats }) => {
+            // Make an HTTP request to create the directory on the remote server
+            const start_time = Date.now();
+            const stream = reference.#manager.read(uri, true);
+            await reference._http_request(
+                'POST',
+                uri,
+                {
+                    'content-length': stats.size.toString(),
+                },
+                stream
+            );
+            reference._log('UPLOAD', `${uri} - FILE - ${Date.now() - start_time}ms`);
+        });
+
+        // Bind a listener for 'file_delete' events
+        this.#map.on('file_delete', async (uri) => {
+            // Make an HTTP request to delete the directory on the remote server
+            const start_time = Date.now();
+            await reference._http_request('DELETE', uri);
+            reference._log('DELETE', `${uri} - FILE - ${Date.now() - start_time}ms`);
+        });
+    }
+
+    /**
+     * Performs a hard files/directories sync with the remote server.
+     *
+     * @private
+     * @param {Object=} schema
+     */
+    async _perform_hard_sync(schema) {
+        // Retrieve a fresh schema from the remote server if one is not provided
+        const start_time = Date.now();
+        if (schema === undefined) {
+            // Retrieve remote host map options and schema
+            const response = await this._http_request('GET');
+            schema = (await response.json()).schema;
+        }
 
         // Perform synchronization of directories/files with remote schema
         const promises = [];
@@ -109,24 +191,20 @@ export default class Mirror extends EventEmitter {
                 const [r_size, r_cat, r_mat] = remote_record;
 
                 // Determine the sync direction for this file record
-                let sync_direction = local_record === undefined ? -1 : 0; // -1 = download, 0 = no sync, 1 = upload
+                let should_download = local_record === undefined;
                 if (local_record) {
                     const [l_size, l_cat, l_mat] = local_record;
 
                     // Determine if local file record is older than remote
-                    if (l_cat < r_cat || l_mat < r_mat) sync_direction = -1;
-                    else if (l_cat > r_cat || l_mat > r_mat) sync_direction = 1;
+                    if (l_cat < r_cat || l_mat < r_mat) should_download = true;
                 }
 
-                // Perform the file sync operation
-                switch (sync_direction) {
-                    case -1:
-                        // Download the file from remote server
-                        const start_ts = Date.now();
-                        const promise = reference._download_file(uri);
-                        promises.push(promise);
-                        promise.then(() => reference._log('DOWNLOAD', `${uri} - ${Date.now() - start_ts}ms`));
-                        break;
+                // Download the file from remote server if it needs to be downloaded
+                if (should_download) {
+                    const start_ts = Date.now();
+                    const download = reference._download_file(uri);
+                    promises.push(download);
+                    download.then(() => reference._log('DOWNLOAD', `${uri} - FILE - ${Date.now() - start_ts}ms`));
                 }
             }
 
@@ -143,6 +221,7 @@ export default class Mirror extends EventEmitter {
 
     /**
      * Creates a websocket connection to the remote server.
+     * @private
      */
     _create_ws_connection() {
         // Create websocket connection here
@@ -154,24 +233,46 @@ export default class Mirror extends EventEmitter {
      * @private
      * @param {('GET'|'POST'|'DELETE')} method
      * @param {String} uri
+     * @param {Object} headers
      * @param {Stream.Readable} body
      * @returns {fetch.Response}
      */
-    async _http_request(method, uri, body) {
+    async _http_request(method, uri, headers, body, retries) {
         // Destructure options to retrive constructor options
         const { hostname, port, ssl, auth } = this.#options;
 
-        // Make the HTTP request
-        return await fetch(
-            `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}${
-                uri ? `&uri=${encodeURIComponent(uri)}` : ''
-            }`,
-            {
-                method,
-                headers: auth?.headers ? auth?.headers : undefined,
-                body,
+        // Safely make the HTTP request
+        let response;
+        try {
+            response = await fetch(
+                `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}${
+                    uri ? `&uri=${encodeURIComponent(uri)}` : ''
+                }`,
+                {
+                    method,
+                    headers: {
+                        ...headers,
+                        ...(auth?.headers ? auth?.headers : {}),
+                    },
+                    body,
+                }
+            );
+
+            // Ensure the response code is non 500x
+            if (response.status >= 500 && response.status < 600)
+                throw new Error('HTTP request failed with status code: ' + response.status);
+        } catch (error) {
+            // Retry the request if there are some retries remaining
+            const { max, delay } = this.#options.retries.http;
+            const remaining = retries === undefined ? max : retries - 1;
+            if (remaining > 0) {
+                // Wait for the specified amount of delay
+                if (delay > 0) await async_wait(delay);
+                return await this._http_request(method, uri, headers, body, remaining);
             }
-        );
+        }
+
+        return response;
     }
 
     /**

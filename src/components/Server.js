@@ -87,7 +87,7 @@ export default class Server extends EventEmitter {
         // Listen on specified user port
         this.#server
             .listen(port)
-            .then(() => this.emit('log', 'STARTUP', `Server started on port ${port}`))
+            .then(() => this._log('STARTUP', `Server started on port ${port}`))
             .catch((error) => this.emit('error', error));
     }
 
@@ -164,11 +164,18 @@ export default class Server extends EventEmitter {
                 });
 
             // Match the incoming request to one of the supported operations
+            let body;
             let operation;
             switch (request.method) {
                 case 'GET':
                     // Retrieve a readable stream for the specified uri
                     operation = manager.read(uri, true);
+                    break;
+                case 'PUT':
+                    // Parse the JSON body to analyze the uri record
+                    // Records with only two properties are directories
+                    body = await request.json();
+                    operation = manager.create(uri, body.length === 2);
                     break;
                 case 'POST':
                     operation = manager.write(uri, request.stream);
@@ -183,7 +190,7 @@ export default class Server extends EventEmitter {
                 // Safely retrieve the output from the operation by awaiting if it is a promise
                 let output;
                 try {
-                    output = output instanceof Promise ? await operation : operation;
+                    output = operation instanceof Promise ? await operation : operation;
                 } catch (error) {
                     // Return the request with the error message
                     return response.status(500).json({
