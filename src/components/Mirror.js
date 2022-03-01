@@ -1,6 +1,7 @@
 import fetch from 'node-fetch';
 import Path from 'path';
 import Stream from 'stream';
+import Websocket from 'ws';
 import FileSystem from 'fs/promises';
 import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
@@ -21,15 +22,9 @@ export default class Mirror extends EventEmitter {
         auth: {
             headers: null,
         },
-        retries: {
-            http: {
-                max: 5,
-                delay: 1000,
-            },
-            ws: {
-                max: Infinity,
-                delay: 2500,
-            },
+        retry: {
+            every: 1000,
+            backoff: true,
         },
     };
 
@@ -188,15 +183,15 @@ export default class Mirror extends EventEmitter {
                 }
             } else {
                 // Destructure the remote record into components [SIZE, CREATED_AT, MODIFIED_AT]
-                const [r_size, r_cat, r_mat] = remote_record;
+                const [r_md5, r_cat, r_mat] = remote_record;
 
                 // Determine the sync direction for this file record
                 let should_download = local_record === undefined;
                 if (local_record) {
-                    const [l_size, l_cat, l_mat] = local_record;
+                    const [l_md5, l_cat, l_mat] = local_record;
 
                     // Determine if local file record is older than remote
-                    if (l_cat < r_cat || l_mat < r_mat) should_download = true;
+                    if (r_md5 !== l_md5 && (l_cat < r_cat || l_mat < r_mat)) should_download = true;
                 }
 
                 // Download the file from remote server if it needs to be downloaded
@@ -220,14 +215,6 @@ export default class Mirror extends EventEmitter {
     }
 
     /**
-     * Creates a websocket connection to the remote server.
-     * @private
-     */
-    _create_ws_connection() {
-        // Create websocket connection here
-    }
-
-    /**
      * Makes an HTTP request to the remote server.
      *
      * @private
@@ -237,7 +224,7 @@ export default class Mirror extends EventEmitter {
      * @param {Stream.Readable} body
      * @returns {fetch.Response}
      */
-    async _http_request(method, uri, headers, body, retries) {
+    async _http_request(method, uri, headers, body, retry_delay) {
         // Destructure options to retrive constructor options
         const { hostname, port, ssl, auth } = this.#options;
 
@@ -263,13 +250,14 @@ export default class Mirror extends EventEmitter {
                 throw new Error('HTTP request failed with status code: ' + response.status);
         } catch (error) {
             // Retry the request if there are some retries remaining
-            const { max, delay } = this.#options.retries.http;
-            const remaining = retries === undefined ? max : retries - 1;
-            if (remaining > 0) {
-                // Wait for the specified amount of delay
-                if (delay > 0) await async_wait(delay);
-                return await this._http_request(method, uri, headers, body, remaining);
-            }
+            const { delay, backoff } = this.#options.retry;
+
+            // Wait for the retry delay if one is provided
+            const cooldown = retry_delay || delay;
+            if (cooldown) await async_wait(cooldown);
+
+            // Retry the request with the updated cooldown
+            return await this._http_request(method, uri, headers, body, backoff ? cooldown * 2 : cooldown);
         }
 
         return response;

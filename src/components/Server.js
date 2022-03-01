@@ -83,6 +83,7 @@ export default class Server extends EventEmitter {
         // Bind the appropriate middlewares & communication routes
         this._bind_authentication_middleware();
         this._bind_http_route();
+        this._bind_ws_route();
 
         // Listen on specified user port
         this.#server
@@ -217,6 +218,19 @@ export default class Server extends EventEmitter {
                     message: `The HTTP method '${request.method}' is not supported.`,
                 });
             }
+        });
+    }
+
+    /**
+     * Binds the master WebSocket route which will handle all incoming websocket communications.
+     * @private
+     */
+    _bind_ws_route() {
+        // Create the global catch-all WebSocket route
+        // We do not need to authenticate this endpoint as the global middleware will authenticate
+        this.#server.ws('/', (ws) => {
+            // Subscribe the connection to 'map_events' topic
+            ws.subscribe('map_events');
         });
     }
 

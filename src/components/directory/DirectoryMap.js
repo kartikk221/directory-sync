@@ -2,8 +2,13 @@ import Path from 'path';
 import Chokidar from 'chokidar';
 import EventEmitter from 'events';
 import FileSystem from 'fs';
-
-import { wrap_object, match_extension, to_forward_slashes, is_accessible_path } from '../../utils/operators.js';
+import {
+    wrap_object,
+    match_extension,
+    to_forward_slashes,
+    is_accessible_path,
+    generate_md5_hash,
+} from '../../utils/operators.js';
 
 /**
  * @typedef {Object} FilteringObject
@@ -236,10 +241,25 @@ export default class DirectoryMap extends EventEmitter {
         // Bind appropriate handlers to consume the watcher events
         this.#watcher.on('addDir', (path, stats) => this._on_directory_create(path, stats));
         this.#watcher.on('unlinkDir', (path) => this._on_directory_delete(path));
-        this.#watcher.on('add', (path, stats) => this._on_file_add(path, stats));
         this.#watcher.on('unlink', (path) => this._on_file_delete(path));
-        this.#watcher.on('change', (path, stats) => this._on_file_change(path, stats));
-        this.#watcher.on('ready', () => this.#ready_resolve());
+
+        // The ready event should wait for all asynchronous operations to complete
+        const promises = [];
+        this.#watcher.on('add', (path, stats) => {
+            const promise = this._on_file_add(path, stats);
+            if (reference.#ready_resolve) promises.push(promise);
+        });
+        this.#watcher.on('change', (path, stats) => {
+            const promise = this._on_file_change(path, stats);
+            if (reference.#ready_resolve) promises.push(promise);
+        });
+
+        // Wait for all pending promises to resolve before resolving the ready promise
+        this.#watcher.on('ready', async () => {
+            if (promises.length > 0) await Promise.all(promises);
+            reference.#ready_resolve();
+            reference.#ready_resolve = null;
+        });
 
         // Bind a global close handler to close the chokidar instance
         // This will prevent the watcher from hanging on to the process
@@ -276,6 +296,7 @@ export default class DirectoryMap extends EventEmitter {
      */
     _filtered_stats(stats) {
         return {
+            md5: stats.md5 || '',
             size: stats.size,
             created_at: Math.round(stats.birthtimeMs),
             modified_at: Math.round(stats.mtimeMs),
@@ -358,7 +379,10 @@ export default class DirectoryMap extends EventEmitter {
      * @param {FileSystem.Stats} stats
      * @param {Boolean} is_change
      */
-    _on_file_add(path, stats, is_change = false) {
+    async _on_file_add(path, stats, is_change = false) {
+        // Generate the MD5 hash for this file
+        stats.md5 = await generate_md5_hash(path);
+
         // Retrieve the relative path to the directory
         const object = this._object_stats(path, stats);
         if (object) {
@@ -397,7 +421,10 @@ export default class DirectoryMap extends EventEmitter {
      * @param {String} path
      * @param {FileSystem.Stats} stats
      */
-    _on_file_change(path, stats) {
+    async _on_file_change(path, stats) {
+        // Update the MD5 hash for this file
+        stats.md5 = stats.size > 0 ? await generate_md5_hash(path) : '';
+
         // Pass through this event to the file add event but as a change event
         this._on_file_add(path, stats, true);
     }
@@ -441,10 +468,10 @@ export default class DirectoryMap extends EventEmitter {
                 .forEach((uri) => {
                     // Convert each record into a simplified array
                     const record = records[uri];
-                    const { size, created_at, modified_at } = record.stats;
+                    const { md5, created_at, modified_at } = record.stats;
 
                     // Only include the size property for FILES only
-                    schema[uri] = index == 0 ? [created_at, modified_at] : [size, created_at, modified_at];
+                    schema[uri] = index == 0 ? [created_at, modified_at] : [md5, created_at, modified_at];
                 });
         });
 

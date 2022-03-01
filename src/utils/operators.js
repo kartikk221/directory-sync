@@ -1,3 +1,4 @@
+import Crypto from 'crypto';
 import FileSystem from 'fs';
 import AsyncFileSystem from 'fs/promises';
 
@@ -81,4 +82,35 @@ async function is_accessible_path(path) {
     return true;
 }
 
-export { wrap_object, async_wait, async_for_each, match_extension, to_forward_slashes, is_accessible_path };
+/**
+ * Generates and returns a MD5 hash of the file at provided path.
+ *
+ * @param {String} path
+ * @returns {Promise<string>}
+ */
+function generate_md5_hash(path) {
+    return new Promise((resolve, reject) => {
+        try {
+            // Initialize a md5 hash and a readable stream for file at specified path
+            const hash = Crypto.createHash('md5');
+            const stream = FileSystem.createReadStream(path);
+
+            // Safely pipe the incoming stream to the hash
+            stream.once('error', reject);
+            stream.on('data', (data) => hash.update(data));
+            stream.on('close', () => resolve(hash.digest('hex')));
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+
+export {
+    wrap_object,
+    async_wait,
+    async_for_each,
+    match_extension,
+    to_forward_slashes,
+    is_accessible_path,
+    generate_md5_hash,
+};
