@@ -12,15 +12,13 @@ export default class Server extends EventEmitter {
     #hosts = {};
     #options = {
         port: 8080,
+        auth: '',
         ssl: {
             key: '',
             cert: '',
             passphrase: '',
             dh_params: '',
             prefer_low_memory_usage: false,
-        },
-        auth: {
-            headers: null,
         },
     };
 
@@ -97,24 +95,19 @@ export default class Server extends EventEmitter {
      * @private
      */
     _bind_authentication_middleware() {
-        // Bind the global middleware for request authentication
-        const headers = this.#options.auth.headers;
+        // Bind the global middleware for network authentication
+        const auth_key = this.#options.auth;
         this.#server.use((request, response, next) => {
-            // Ensure that the request has all of the required auth headers
-            let is_authenticated = true;
-            if (typeof headers == 'object')
-                Object.keys(headers).forEach((key) => {
-                    const value = headers[key];
-                    if (request.headers[key] !== value) is_authenticated = false;
-                });
+            // Retrieve the incoming request's authorization key
+            const incoming_key = request.headers['x-auth-key'] || request.query_parameters['auth_key'] || '';
 
             // Process request based on whether request is authenticated
-            if (is_authenticated) {
+            if (auth_key === incoming_key) {
                 return next();
             } else {
                 return response.status(403).json({
                     code: 'UNAUTHORIZED',
-                    message: 'Please provide valid authentication headers.',
+                    message: 'Please provide a valid authentication key.',
                 });
             }
         });

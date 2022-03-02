@@ -2,11 +2,7 @@ import * as DirectorySync from '../index.js';
 
 const TestServer = new DirectorySync.Server({
     port: 8080,
-    auth: {
-        headers: {
-            'x-key': 'development',
-        },
-    },
+    auth: 'development',
 });
 
 // Bind appropriate listeners to Server
@@ -22,11 +18,7 @@ TestServer.on('error', (error) => console.log(`[SERVER]`, error));
         path: './mirrored',
         hostname: 'localhost',
         port: 8080,
-        auth: {
-            headers: {
-                'x-key': 'development',
-            },
-        },
+        auth: 'development',
     });
 
     // Bind appropriate listeners to Mirror
