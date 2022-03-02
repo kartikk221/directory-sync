@@ -125,20 +125,7 @@ export default class Mirror extends EventEmitter {
         });
 
         // Bind a listener for 'file_change' events
-        this.#map.on('file_change', async (uri, { stats }) => {
-            // Make an HTTP request to create the directory on the remote server
-            const start_time = Date.now();
-            const stream = reference.#manager.read(uri, true);
-            await reference._http_request(
-                'POST',
-                uri,
-                {
-                    'content-length': stats.size.toString(),
-                },
-                stream
-            );
-            reference._log('UPLOAD', `${uri} - FILE - ${Date.now() - start_time}ms`);
-        });
+        this.#map.on('file_change', (uri) => this._upload_file(uri));
 
         // Bind a listener for 'file_delete' events
         this.#map.on('file_delete', async (uri) => {
@@ -164,6 +151,8 @@ export default class Mirror extends EventEmitter {
             schema = (await response.json()).schema;
         }
 
+        // TOOD: Ensure that we sync local directories with remote to ensure file errors don't occur
+
         // Perform synchronization of directories/files with remote schema
         const promises = [];
         const reference = this;
@@ -186,20 +175,21 @@ export default class Mirror extends EventEmitter {
                 const [r_md5, r_cat, r_mat] = remote_record;
 
                 // Determine the sync direction for this file record
-                let should_download = local_record === undefined;
+                let sync_direction = local_record === undefined ? -1 : 0;
                 if (local_record) {
+                    // Determine if the MD5 hash of the local file matches the remote file
                     const [l_md5, l_cat, l_mat] = local_record;
-
-                    // Determine if local file record is older than remote
-                    if (r_md5 !== l_md5 && (l_cat < r_cat || l_mat < r_mat)) should_download = true;
+                    if (l_md5 !== r_md5) sync_direction = l_cat < r_cat || l_mat < r_mat ? -1 : 1;
                 }
 
-                // Download the file from remote server if it needs to be downloaded
-                if (should_download) {
-                    const start_ts = Date.now();
-                    const download = reference._download_file(uri);
-                    promises.push(download);
-                    download.then(() => reference._log('DOWNLOAD', `${uri} - FILE - ${Date.now() - start_ts}ms`));
+                // Perform the sync operation
+                switch (sync_direction) {
+                    case -1:
+                        promises.push(reference._download_file(uri));
+                        break;
+                    case 1:
+                        promises.push(reference._upload_file(uri));
+                        break;
                 }
             }
 
@@ -271,12 +261,37 @@ export default class Mirror extends EventEmitter {
      */
     async _download_file(uri) {
         // Make the HTTP request to retrieve the file stream
+        const start_time = Date.now();
         const { status, body } = await this._http_request('GET', uri);
 
         // Ensure the response status code is valid
         if (status !== 200) throw new Error(`_download_file(${uri}) -> HTTP ${status}`);
 
         // Write the file stream to local directory
-        return await this.#manager.write(uri, body);
+        await this.#manager.write(uri, body);
+        this._log('DOWNLOAD', `${uri} - FILE - ${Date.now() - start_time}ms`);
+    }
+
+    /**
+     * Uploads file at the specified URI to the remote server.
+     *
+     * @param {String} uri
+     */
+    async _upload_file(uri) {
+        // Retrieve a readable stream for the file
+        const start_time = Date.now();
+        const stream = this.#manager.read(uri, true);
+
+        // Make HTTP request to upload the file
+        const { stats } = this.#map.get(uri);
+        await this._http_request(
+            'POST',
+            uri,
+            {
+                'content-length': stats.size.toString(),
+            },
+            stream
+        );
+        this._log('UPLOAD', `${uri} - FILE - ${Date.now() - start_time}ms`);
     }
 }
