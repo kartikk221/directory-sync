@@ -15,7 +15,8 @@ const ws_pool = {};
 
 // Bind a global close handler to close all websocket connections
 ['exit', 'SIGINT', 'SIGUSR1', 'SIGUSR2', 'SIGTERM', 'uncaughtException'].forEach((type) =>
-    process.once(type, () => {
+    process.once(type, (arg1) => {
+        if (type === 'uncaughtException') console.error(arg1);
         Object.keys(ws_pool).forEach((key) => ws_pool[key].close());
         process.exit();
     })
@@ -110,23 +111,52 @@ export default class Mirror extends EventEmitter {
     _initialize_ws_uplink() {
         // Determine a unique hostname:port:host key for sharing ws connections
         const { auth, ssl, hostname, port, retry } = this.#options;
-        const identity = `${hostname}:${port}:${this.#host}`;
+        const identity = `${hostname}:${port}`;
+        const is_initial = this.#ws === undefined;
         if (ws_pool[identity]) {
             // Re-use the shared ws connection
             this.#ws = ws_pool[identity];
 
             // Listen for the recalibrate event to handle disconnections
             this.#ws.once('recalibrate', () => this._initialize_ws_uplink());
+
+            // Subscribe to the remote server's events for this host
+            this.#ws.send(
+                JSON.stringify({
+                    command: 'SUBSCRIBE',
+                    host: this.#host,
+                })
+            );
+
+            // Perform a hard sync to ensure all files/directories are in sync
+            if (!is_initial) this._perform_hard_sync();
         } else {
             // Initialize a websocket connection to the remote server
             const reference = this;
             const connection = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}/?auth_key=${auth}`);
+            this.#ws = connection;
 
             // Handle the 'open' event
             connection.on('open', () => {
                 // Reset the ws cooldown for future retries
                 reference.#ws_cooldown = 0;
-                reference._log('WEBSOCKET', `CONNECTED - ${hostname}:${port} - ${this.#host}`);
+                reference._log('WEBSOCKET', `CONNECTED - ${hostname}:${port}`);
+
+                // Subscribe to the remote server's events for this host
+                connection.send(
+                    JSON.stringify({
+                        command: 'SUBSCRIBE',
+                        host: reference.#host,
+                    })
+                );
+
+                // Modify the shared websocket pool connection and recalibrate with consumers
+                const current = ws_pool[identity];
+                ws_pool[identity] = connection;
+                if (current) current.emit('recalibrate');
+
+                // Perform a hard sync to ensure all files/directories are in sync
+                if (!is_initial) reference._perform_hard_sync();
             });
 
             // Handle the 'close' event to handle reconnection
@@ -146,19 +176,13 @@ export default class Mirror extends EventEmitter {
                 // Retry the connection uplink
                 this.#ws_cooldown = backoff ? cooldown * 2 : cooldown;
                 reference._initialize_ws_uplink();
-
-                // Emit the 'recalibrate' event for peer shared instances to use the new connection
-                setTimeout(() => connection.emit('recalibrate'), 0);
             });
-
-            // Store the ws connection in the ws pool and locally
-            this.#ws = connection;
-            ws_pool[identity] = connection;
         }
 
         // Handle the 'message' event to handle incoming events
         this.#ws.on('message', (buffer) => {
             const string = buffer.toString();
+            console.log(string.split(','));
         });
     }
 
@@ -170,12 +194,7 @@ export default class Mirror extends EventEmitter {
         const reference = this;
 
         // Bind a listener for 'directory_create' events
-        this.#map.on('directory_create', async (uri, { stats }) => {
-            // Make an HTTP request to create the directory on the remote server
-            const start_time = Date.now();
-            await reference._http_request('PUT', uri, {}, JSON.stringify([stats.created_at, stats.modified_at]));
-            reference._log('CREATE', `${uri} - DIRECTORY - ${Date.now() - start_time}ms`);
-        });
+        this.#map.on('directory_create', (uri) => this._create_remote_directory(uri));
 
         // Bind a listener for 'directory_delete' events
         this.#map.on('directory_delete', async (uri) => {
@@ -218,22 +237,44 @@ export default class Mirror extends EventEmitter {
      */
     async _perform_hard_sync(schema) {
         // Retrieve a fresh schema from the remote server if one is not provided
+        const promises = [];
+        const reference = this;
         const start_time = Date.now();
+        const local_schema = this.#map.schema;
         if (schema === undefined) {
             // Retrieve remote host map options and schema
             const response = await this._http_request('GET');
             schema = (await response.json()).schema;
         }
 
-        // TOOD: Ensure that we sync local directories with remote to ensure file errors don't occur
+        // Perform local->remote synchronization based on schemas
+        // We will only sync if the remote server has no record at all for each local record
+        await async_for_each(Object.keys(local_schema), async (uri, next) => {
+            const remote_record = schema[uri];
+            const local_record = local_schema[uri];
+            const is_directory = local_record.length === 2;
 
-        // Perform synchronization of directories/files with remote schema
-        const promises = [];
-        const reference = this;
+            // Determine if the remote record is not defined at all
+            if (remote_record === undefined) {
+                if (is_directory) {
+                    // Create a remote directory as it does not exist in remote server
+                    await reference._create_remote_directory(uri);
+                } else {
+                    // Upload the local file to remote server as it does not exist in remote server
+                    promises.push(reference._upload_file(uri));
+                }
+            }
+
+            // Proceed to next record
+            next();
+        });
+
+        // Perform remote->local synchronization based on schemas
+        // We will sync based on whether local or remote is newer calculated by the higher created_at/modified_at timestamp
         await async_for_each(Object.keys(schema), async (uri, next) => {
             // Determine the local and remote schema records
             const remote_record = schema[uri];
-            const local_record = reference.#map.schema[uri];
+            const local_record = local_schema[uri];
             const is_directory = remote_record.length === 2;
 
             // Handle case where local remote record is a directory
@@ -285,7 +326,7 @@ export default class Mirror extends EventEmitter {
      * Makes an HTTP request to the remote server.
      *
      * @private
-     * @param {('GET'|'POST'|'DELETE')} method
+     * @param {('GET'|'POST'|'PUT'|'DELETE')} method
      * @param {String} uri
      * @param {Object} headers
      * @param {Stream.Readable} body
@@ -343,6 +384,20 @@ export default class Mirror extends EventEmitter {
     }
 
     /**
+     * Creates a directory record with remote server based on local directory.
+     *
+     * @param {String} uri
+     */
+    async _create_remote_directory(uri) {
+        // Make an HTTP request to create the directory on the remote server
+        const start_time = Date.now();
+        const { stats } = this.#map.get(uri);
+        const { created_at, modified_at } = stats;
+        await this._http_request('PUT', uri, {}, JSON.stringify([created_at, modified_at]));
+        this._log('CREATE', `${uri} - DIRECTORY - ${Date.now() - start_time}ms`);
+    }
+
+    /**
      * Returns a readable stream for a file from the remote server.
      *
      * @param {String} uri
@@ -362,7 +417,7 @@ export default class Mirror extends EventEmitter {
     }
 
     /**
-     * Uploads file at the specified URI to the remote server.
+     * Uploads local file at the specified URI to the remote server.
      *
      * @param {String} uri
      */

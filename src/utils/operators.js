@@ -105,6 +105,20 @@ function generate_md5_hash(path) {
     });
 }
 
+/**
+ * Safely parses a string into a JSON object.
+ *
+ * @param {String} string
+ * @returns {Object=}
+ */
+function safe_json_parse(string) {
+    let json;
+    try {
+        json = JSON.parse(string);
+    } catch (error) {}
+    if (json) return json;
+}
+
 export {
     wrap_object,
     async_wait,
@@ -113,4 +127,5 @@ export {
     to_forward_slashes,
     is_accessible_path,
     generate_md5_hash,
+    safe_json_parse,
 };

@@ -6,7 +6,7 @@ const TestServer = new DirectorySync.Server({
 });
 
 // Bind appropriate listeners to Server
-TestServer.on('log', (code, message) => console.log(`[SERVER] ${code} -> ${message}`));
+TestServer.on('log', (code, message) => console.log(`[SERVER][${code}] ${message}`));
 TestServer.on('error', (error) => console.log(`[SERVER]`, error));
 
 (async () => {
@@ -22,6 +22,6 @@ TestServer.on('error', (error) => console.log(`[SERVER]`, error));
     });
 
     // Bind appropriate listeners to Mirror
-    TestMirror.on('log', (code, message) => console.log(`[MIRROR] ${code} -> ${message}`));
+    TestMirror.on('log', (code, message) => console.log(`[MIRROR][${code}] ${message}`));
     TestMirror.on('error', (error) => console.log(`[MIRROR]`, error));
 })();
