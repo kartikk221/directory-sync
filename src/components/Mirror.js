@@ -7,7 +7,14 @@ import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
 
-import { wrap_object, to_forward_slashes, is_accessible_path, async_for_each, async_wait } from '../utils/operators.js';
+import {
+    wrap_object,
+    to_forward_slashes,
+    is_accessible_path,
+    async_for_each,
+    async_wait,
+    safe_json_parse,
+} from '../utils/operators.js';
 
 // This will hold the shared websocket connections to remote servers
 // We will ideally only want a single connection for multiple hosts on the same remote server
@@ -180,9 +187,16 @@ export default class Mirror extends EventEmitter {
         }
 
         // Handle the 'message' event to handle incoming events
+        const reference = this;
         this.#ws.on('message', (buffer) => {
-            const string = buffer.toString();
-            console.log(string.split(','));
+            // Safely parse incoming command as JSON and handle it based message.command
+            const message = safe_json_parse(buffer.toString());
+            if (message)
+                switch (message.command) {
+                    case 'MUTATION':
+                        const { type, uri, is_directory } = message;
+                        return reference._handle_remote_mutation(type, uri, is_directory);
+                }
         });
     }
 
@@ -227,6 +241,34 @@ export default class Mirror extends EventEmitter {
             await reference._http_request('DELETE', uri);
             reference._log('DELETE', `${uri} - FILE - ${Date.now() - start_time}ms`);
         });
+    }
+
+    /**
+     * Handles incoming remote MUTATION command to synchronize remote->local.
+     *
+     * @param {('CREATE'|'MODIFIED'|'DELETE')} type
+     * @param {String} uri
+     * @param {Boolean} is_directory
+     */
+    async _handle_remote_mutation(type, uri, is_directory = true) {
+        // Continue here performing remote mutations -----
+        switch (type) {
+            case 'CREATE':
+                // Create the directory/file with local manager
+                this.#manager.create(uri, is_directory);
+                this._log('CREATE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
+                break;
+            case 'MODIFIED':
+                // Download the file from remote as it has been modified
+                this._log('MODIFIED', `${uri} - SERVER - FILE`);
+                this._download_file(uri);
+                break;
+            case 'DELETE':
+                // Delete the directory/file with local manager
+                this.#manager.delete(uri, is_directory);
+                this._log('DELETE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
+                break;
+        }
     }
 
     /**

@@ -5,7 +5,13 @@ import HyperExpress from 'hyper-express';
 import DirectoryMap from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
 
-import { wrap_object, is_accessible_path, to_forward_slashes, safe_json_parse } from '../utils/operators.js';
+import {
+    wrap_object,
+    is_accessible_path,
+    to_forward_slashes,
+    safe_json_parse,
+    ascii_to_hex,
+} from '../utils/operators.js';
 
 export default class Server extends EventEmitter {
     #server;
@@ -240,8 +246,8 @@ export default class Server extends EventEmitter {
                 if (message)
                     switch (message.command) {
                         case 'SUBSCRIBE':
-                            // Subscribe to the specified host
-                            const topic = `host${message.host}`;
+                            // Subscribe to the specified host in hexadecimal format
+                            const topic = `events/${ascii_to_hex(message.host)}`;
                             if (!ws.is_subscribed(topic)) {
                                 reference._log('WEBSOCKET', `SUBSCRIBED - ${ws.ip} - '${message.host}'`);
                                 ws.subscribe(topic);
@@ -286,12 +292,63 @@ export default class Server extends EventEmitter {
         // Wait for the DirectoryMap to be ready
         await map.ready();
 
+        // Bind mutation emitters for this host
+        this._bind_mutation_emitters(name, map);
+
         // Create a record for this host instance
         this.#hosts[name] = {
             path,
             map,
             manager,
         };
+    }
+
+    /**
+     * Publishes a mutation event to all websocket consumers for the specified host identifier.
+     *
+     * @param {String} identifier
+     * @param {('CREATE'|'MODIFIED'|'DELETE')} type
+     * @param {String} uri
+     * @param {Boolean} is_directory
+     */
+    _publish_mutation(identifier, type, uri, is_directory = true) {
+        // Emit a 'mutation' event with the provided type, uri, and is_directory
+        this.#server.publish(
+            `events/${identifier}`,
+            JSON.stringify({
+                command: 'MUTATION',
+                type,
+                uri,
+                is_directory,
+            })
+        );
+    }
+
+    /**
+     * Binds handlers to the host map for emitting mutationst.
+     *
+     * @private
+     * @param {String} host
+     * @param {DirectoryMap} map
+     */
+    _bind_mutation_emitters(host, map) {
+        // Destructure the DirectoryMap instance from the host record
+        const identifier = ascii_to_hex(host);
+
+        // Bind a 'directory_create' handler to publish mutations
+        map.on('directory_create', (uri) => this._publish_mutation(identifier, 'CREATE', uri, true));
+
+        // Bind a 'directory_delete' handler to publish mutations
+        map.on('directory_delete', (uri) => this._publish_mutation(identifier, 'DELETE', uri, true));
+
+        // Bind a 'file_create' handler to publish mutations
+        map.on('file_create', (uri) => this._publish_mutation(identifier, 'CREATE', uri, false));
+
+        // Bind a 'file_change' handler to publish mutations
+        map.on('file_change', (uri) => this._publish_mutation(identifier, 'MODIFIED', uri, false));
+
+        // Bind a 'file_delete' handler to publish mutations
+        map.on('file_delete', (uri) => this._publish_mutation(identifier, 'DELETE', uri, false));
     }
 
     /**

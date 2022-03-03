@@ -119,6 +119,26 @@ function safe_json_parse(string) {
     if (json) return json;
 }
 
+/**
+ * Converts ASCII string to Hexadecimal string.
+ *
+ * @param {String} string
+ * @returns {String}
+ */
+function ascii_to_hex(string) {
+    return Buffer.from(string).toString('hex');
+}
+
+/**
+ * Converts Hexadecimal string to ASCII string.
+ *
+ * @param {String} string
+ * @returns {String}
+ */
+function hex_to_ascii(string) {
+    return Buffer.from(string, 'hex').toString('ascii');
+}
+
 export {
     wrap_object,
     async_wait,
@@ -128,4 +148,6 @@ export {
     is_accessible_path,
     generate_md5_hash,
     safe_json_parse,
+    ascii_to_hex,
+    hex_to_ascii,
 };

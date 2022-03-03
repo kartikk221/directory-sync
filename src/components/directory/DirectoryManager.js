@@ -23,16 +23,18 @@ export default class DirectoryManager {
      *
      * @param {String} uri
      * @param {Boolean} is_directory
-     * @returns {Promise}
+     * @returns {Promise=}
      */
     create(uri, is_directory = false) {
-        const path = this._absolute_path(uri);
-        if (is_directory) {
-            this.#map.supress(uri, 'directory_create', 1);
-            return FileSystem.mkdir(path);
-        } else {
-            this.#map.supress(uri, 'file_create', 1);
-            return FileSystem.writeFile(path, '');
+        if (!this.#map.get(uri)) {
+            const path = this._absolute_path(uri);
+            if (is_directory) {
+                this.#map.supress(uri, 'directory_create', 1);
+                return FileSystem.mkdir(path);
+            } else {
+                this.#map.supress(uri, 'file_create', 1);
+                return FileSystem.writeFile(path, '');
+            }
         }
     }
 
@@ -83,10 +85,15 @@ export default class DirectoryManager {
      *
      * @param {String} uri
      * @param {Boolean} is_directory
+     * @returns {Promise=}
      */
     delete(uri, is_directory = false) {
-        const path = this._absolute_path(uri);
-        this.#map.supress(uri, is_directory ? 'directory_delete' : 'file_delete', 1);
-        return FileSystem.rm(path);
+        if (this.#map.get(uri)) {
+            const path = this._absolute_path(uri);
+            this.#map.supress(uri, is_directory ? 'directory_delete' : 'file_delete', 1);
+            return FileSystem.rm(path, {
+                recursive: true,
+            });
+        }
     }
 }
