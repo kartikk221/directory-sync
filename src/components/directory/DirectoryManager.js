@@ -91,9 +91,17 @@ export default class DirectoryManager {
         if (this.#map.get(uri)) {
             const path = this._absolute_path(uri);
             this.#map.supress(uri, is_directory ? 'directory_delete' : 'file_delete', 1);
-            return FileSystem.rm(path, {
-                recursive: true,
-            });
+            return new Promise((resolve, reject) =>
+                FileSystem.rm(path, {
+                    recursive: true,
+                })
+                    .then(resolve)
+                    .catch((error) => {
+                        // Supress 'ENOENT' errors
+                        if (error.code === 'ENOENT') resolve();
+                        reject(error);
+                    })
+            );
         }
     }
 }

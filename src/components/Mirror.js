@@ -7,6 +7,7 @@ import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
 
+import { randomUUID } from 'crypto';
 import {
     wrap_object,
     to_forward_slashes,
@@ -30,6 +31,7 @@ const ws_pool = {};
 );
 
 export default class Mirror extends EventEmitter {
+    #id;
     #ws;
     #map;
     #manager;
@@ -57,6 +59,9 @@ export default class Mirror extends EventEmitter {
         // Wrap default options object with provided options
         if (options === null || typeof options !== 'object')
             throw new Error('new DirectorySync.Mirror(options) -> options must be an object');
+
+        // Initialize the mirror instance with unique uuid identifier for actor matching
+        this.#id = randomUUID();
         this.#host = host;
         wrap_object(this.#options, options);
 
@@ -115,8 +120,9 @@ export default class Mirror extends EventEmitter {
      * Initializes the websocket uplink to receive host events from the remote server.
      * @private
      */
-    _initialize_ws_uplink() {
+    async _initialize_ws_uplink() {
         // Determine a unique hostname:port:host key for sharing ws connections
+        const reference = this;
         const { auth, ssl, hostname, port, retry } = this.#options;
         const identity = `${hostname}:${port}`;
         const is_initial = this.#ws === undefined;
@@ -127,24 +133,31 @@ export default class Mirror extends EventEmitter {
             // Listen for the recalibrate event to handle disconnections
             this.#ws.once('recalibrate', () => this._initialize_ws_uplink());
 
-            // Subscribe to the remote server's events for this host
-            this.#ws.send(
-                JSON.stringify({
-                    command: 'SUBSCRIBE',
-                    host: this.#host,
-                })
-            );
+            // Listen for the 'open' event to handle subscriptions and synchronization
+            this.#ws.once('open', () => {
+                // Subscribe to the remote server's events for this host
+                reference.#ws.send(
+                    JSON.stringify({
+                        command: 'SUBSCRIBE',
+                        host: this.#host,
+                    })
+                );
 
-            // Perform a hard sync to ensure all files/directories are in sync
-            if (!is_initial) this._perform_hard_sync();
+                // Perform a hard sync to ensure all files/directories are in sync
+                if (!is_initial) reference._perform_hard_sync();
+            });
         } else {
             // Initialize a websocket connection to the remote server
             const reference = this;
             const connection = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}/?auth_key=${auth}`);
             this.#ws = connection;
 
+            // Overwrite the pooled connection
+            const old_connection = ws_pool[identity];
+            ws_pool[identity] = connection;
+
             // Handle the 'open' event
-            connection.on('open', () => {
+            connection.once('open', () => {
                 // Reset the ws cooldown for future retries
                 reference.#ws_cooldown = 0;
                 reference._log('WEBSOCKET', `CONNECTED - ${hostname}:${port}`);
@@ -157,18 +170,19 @@ export default class Mirror extends EventEmitter {
                     })
                 );
 
-                // Modify the shared websocket pool connection and recalibrate with consumers
-                const current = ws_pool[identity];
-                ws_pool[identity] = connection;
-                if (current) current.emit('recalibrate');
+                // Recalibrate the old pooled connection
+                if (old_connection) old_connection.emit('recalibrate');
 
                 // Perform a hard sync to ensure all files/directories are in sync
                 if (!is_initial) reference._perform_hard_sync();
             });
 
+            // Handle the 'error' event
+            connection.once('error', (error) => this.emit('error', error));
+
             // Handle the 'close' event to handle reconnection
             const { every, backoff } = retry;
-            connection.on('close', async () => {
+            connection.once('close', async () => {
                 // Wait for the cooldown to expire before attempting to reconnect
                 const cooldown = reference.#ws_cooldown || every;
                 reference._log(
@@ -177,9 +191,6 @@ export default class Mirror extends EventEmitter {
                 );
                 await async_wait(cooldown);
 
-                // Cleanup this cached connection
-                delete ws_pool[identity];
-
                 // Retry the connection uplink
                 this.#ws_cooldown = backoff ? cooldown * 2 : cooldown;
                 reference._initialize_ws_uplink();
@@ -187,15 +198,15 @@ export default class Mirror extends EventEmitter {
         }
 
         // Handle the 'message' event to handle incoming events
-        const reference = this;
         this.#ws.on('message', (buffer) => {
             // Safely parse incoming command as JSON and handle it based message.command
             const message = safe_json_parse(buffer.toString());
             if (message)
                 switch (message.command) {
                     case 'MUTATION':
-                        const { type, uri, is_directory } = message;
-                        return reference._handle_remote_mutation(type, uri, is_directory);
+                        // Handle the incoming mutation event
+                        const { actor, type, uri, is_directory } = message;
+                        return reference._handle_remote_mutation(actor, type, uri, is_directory);
                 }
         });
     }
@@ -246,29 +257,31 @@ export default class Mirror extends EventEmitter {
     /**
      * Handles incoming remote MUTATION command to synchronize remote->local.
      *
+     * @param {String} actor
      * @param {('CREATE'|'MODIFIED'|'DELETE')} type
      * @param {String} uri
      * @param {Boolean} is_directory
      */
-    async _handle_remote_mutation(type, uri, is_directory = true) {
-        // Continue here performing remote mutations -----
-        switch (type) {
-            case 'CREATE':
-                // Create the directory/file with local manager
-                this.#manager.create(uri, is_directory);
-                this._log('CREATE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
-                break;
-            case 'MODIFIED':
-                // Download the file from remote as it has been modified
-                this._log('MODIFIED', `${uri} - SERVER - FILE`);
-                this._download_file(uri);
-                break;
-            case 'DELETE':
-                // Delete the directory/file with local manager
-                this.#manager.delete(uri, is_directory);
-                this._log('DELETE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
-                break;
-        }
+    async _handle_remote_mutation(actor, type, uri, is_directory = true) {
+        // Handle mutation event if it's actor id does not match the self id
+        if (this.#id !== actor)
+            switch (type) {
+                case 'CREATE':
+                    // Create the directory/file with local manager
+                    this.#manager.create(uri, is_directory);
+                    this._log('CREATE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
+                    break;
+                case 'MODIFIED':
+                    // Download the file from remote as it has been modified
+                    this._log('MODIFIED', `${uri} - SERVER - FILE`);
+                    this._download_file(uri);
+                    break;
+                case 'DELETE':
+                    // Delete the directory/file with local manager
+                    this.#manager.delete(uri, is_directory);
+                    this._log('DELETE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
+                    break;
+            }
     }
 
     /**
@@ -376,13 +389,14 @@ export default class Mirror extends EventEmitter {
      */
     async _http_request(method, uri, headers, body, retry_delay) {
         // Destructure options to retrive constructor options
+        const actor = this.#id;
         const { hostname, port, ssl, auth } = this.#options;
 
         // Safely make the HTTP request
         let response;
         try {
             response = await fetch(
-                `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}${
+                `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}&actor=${actor}${
                     uri ? `&uri=${encodeURIComponent(uri)}` : ''
                 }`,
                 {

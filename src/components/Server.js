@@ -127,7 +127,7 @@ export default class Server extends EventEmitter {
         // Create the global catch-all HTTP route
         this.#server.any('/', async (request, response) => {
             // Destructure various path/query parameters
-            let { host, uri } = request.query_parameters;
+            let { uri, host, actor } = request.query_parameters;
 
             // Decode the host/uri url encoded components
             host = decodeURIComponent(host);
@@ -161,6 +161,7 @@ export default class Server extends EventEmitter {
             let body;
             let operation;
             let descriptor;
+            let is_directory = false;
             switch (request.method) {
                 case 'GET':
                     // Ensure that the uri has a valid record in our map
@@ -179,7 +180,8 @@ export default class Server extends EventEmitter {
                     // Records with only two properties are directories
                     descriptor = 'CREATE';
                     body = await request.json();
-                    operation = manager.create(uri, body.length === 2);
+                    is_directory = body.length === 2;
+                    operation = manager.create(uri, is_directory);
                     break;
                 case 'POST':
                     descriptor = 'DOWNLOAD';
@@ -198,6 +200,8 @@ export default class Server extends EventEmitter {
                 try {
                     const start_time = Date.now();
                     output = operation instanceof Promise ? await operation : operation;
+
+                    // Log the operation if it has a mutation descriptor
                     this._log(descriptor, `${request.ip} - '${host}' - ${uri} - ${Date.now() - start_time}ms`);
                 } catch (error) {
                     // Return the request with the error message
@@ -206,6 +210,13 @@ export default class Server extends EventEmitter {
                         message: 'An uncaught error DirectoryManager error occured.',
                         error: error?.message,
                     });
+                }
+
+                // Publish a mutation event if this operation causes a mutation
+                if (descriptor !== 'UPLOAD') {
+                    const identifier = ascii_to_hex(host);
+                    const mutation = descriptor === 'DOWNLOAD' ? 'MODIFIED' : descriptor;
+                    this._publish_mutation(identifier, actor, mutation, uri, is_directory);
                 }
 
                 // If the output of the operation is a readable stream, pipe it as the response
@@ -307,16 +318,18 @@ export default class Server extends EventEmitter {
      * Publishes a mutation event to all websocket consumers for the specified host identifier.
      *
      * @param {String} identifier
+     * @param {String} actor
      * @param {('CREATE'|'MODIFIED'|'DELETE')} type
      * @param {String} uri
      * @param {Boolean} is_directory
      */
-    _publish_mutation(identifier, type, uri, is_directory = true) {
+    _publish_mutation(identifier, actor, type, uri, is_directory = true) {
         // Emit a 'mutation' event with the provided type, uri, and is_directory
         this.#server.publish(
             `events/${identifier}`,
             JSON.stringify({
                 command: 'MUTATION',
+                actor,
                 type,
                 uri,
                 is_directory,
@@ -336,19 +349,19 @@ export default class Server extends EventEmitter {
         const identifier = ascii_to_hex(host);
 
         // Bind a 'directory_create' handler to publish mutations
-        map.on('directory_create', (uri) => this._publish_mutation(identifier, 'CREATE', uri, true));
+        map.on('directory_create', (uri) => this._publish_mutation(identifier, 'SERVER', 'CREATE', uri, true));
 
         // Bind a 'directory_delete' handler to publish mutations
-        map.on('directory_delete', (uri) => this._publish_mutation(identifier, 'DELETE', uri, true));
+        map.on('directory_delete', (uri) => this._publish_mutation(identifier, 'SERVER', 'DELETE', uri, true));
 
         // Bind a 'file_create' handler to publish mutations
-        map.on('file_create', (uri) => this._publish_mutation(identifier, 'CREATE', uri, false));
+        map.on('file_create', (uri) => this._publish_mutation(identifier, 'SERVER', 'CREATE', uri, false));
 
         // Bind a 'file_change' handler to publish mutations
-        map.on('file_change', (uri) => this._publish_mutation(identifier, 'MODIFIED', uri, false));
+        map.on('file_change', (uri) => this._publish_mutation(identifier, 'SERVER', 'MODIFIED', uri, false));
 
         // Bind a 'file_delete' handler to publish mutations
-        map.on('file_delete', (uri) => this._publish_mutation(identifier, 'DELETE', uri, false));
+        map.on('file_delete', (uri) => this._publish_mutation(identifier, 'SERVER', 'DELETE', uri, false));
     }
 
     /**
