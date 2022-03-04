@@ -11,6 +11,7 @@ import {
     to_forward_slashes,
     safe_json_parse,
     ascii_to_hex,
+    hex_to_ascii,
 } from '../utils/operators.js';
 
 export default class Server extends EventEmitter {
@@ -324,6 +325,13 @@ export default class Server extends EventEmitter {
      * @param {Boolean} is_directory
      */
     _publish_mutation(identifier, actor, type, uri, is_directory = true) {
+        // Log the mutation if it is from the server
+        if (actor === 'SERVER')
+            this._log(
+                'MUTATION',
+                `'${hex_to_ascii(identifier)}' - ${type} - ${uri} - ${is_directory ? 'DIRECTORY' : 'FILE'}`
+            );
+
         // Emit a 'mutation' event with the provided type, uri, and is_directory
         this.#server.publish(
             `events/${identifier}`,

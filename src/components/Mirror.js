@@ -34,8 +34,9 @@ export default class Mirror extends EventEmitter {
     #id;
     #ws;
     #map;
-    #manager;
     #host;
+    #manager;
+    #destroyed = false;
     #options = {
         path: '',
         hostname: '',
@@ -67,6 +68,19 @@ export default class Mirror extends EventEmitter {
 
         // Initialize local actors
         this._initialize_actors();
+    }
+
+    /**
+     * Destroys this Mirror instance.
+     *
+     * @returns {Promise}
+     */
+    async destroy() {
+        // Destroy the DirectoryMap instance
+        await this.#map.destroy();
+
+        // Mark this instance as destroyed
+        this.#destroyed = true;
     }
 
     /**
@@ -114,27 +128,75 @@ export default class Mirror extends EventEmitter {
         this._initialize_ws_uplink();
     }
 
-    #ws_cooldown = 0;
+    #ws_cooldown;
 
     /**
      * Initializes the websocket uplink to receive host events from the remote server.
+     *
      * @private
+     * @param {Boolean} pooling
      */
-    async _initialize_ws_uplink() {
+    async _initialize_ws_uplink(pooling = true) {
         // Determine a unique hostname:port:host key for sharing ws connections
         const reference = this;
         const { auth, ssl, hostname, port, retry } = this.#options;
         const identity = `${hostname}:${port}`;
         const is_initial = this.#ws === undefined;
-        if (ws_pool[identity]) {
+        if (pooling && ws_pool[identity]) {
             // Re-use the shared ws connection
             this.#ws = ws_pool[identity];
+            console.log(`[${this.#id}] Re-using shared ws connection to ${identity}`);
 
-            // Listen for the recalibrate event to handle disconnections
-            this.#ws.once('recalibrate', () => this._initialize_ws_uplink());
+            // Wait for the pooled connection to either open or close
+            await new Promise((resolve) => {
+                // Create a passthrough resolve reference which we can nullify  after use
+                let _resolve = resolve;
 
-            // Listen for the 'open' event to handle subscriptions and synchronization
-            this.#ws.once('open', () => {
+                // If the connection was already opened, then resolve immediately
+                if (reference.#ws.readyState === Websocket.OPEN) {
+                    _resolve();
+                    _resolve = null;
+                }
+
+                // Listen for the 'open' event to know when the connection is ready
+                reference.#ws.on('open', () => {
+                    // Resolve the state promise if it has not already been resolved
+                    if (_resolve) {
+                        _resolve();
+                        _resolve = null;
+                    }
+                });
+
+                // Listen for the 'close' event to handle reconnection
+                const { every, backoff } = retry;
+                reference.#ws.once('close', async () => {
+                    // Resolve the state promise if it has not already been resolved
+                    if (_resolve) {
+                        _resolve();
+                        _resolve = null;
+                    }
+
+                    // Wait for the cooldown to expire before attempting to reconnect
+                    const cooldown = reference.#ws_cooldown || every;
+                    reference._log(
+                        'WEBSOCKET',
+                        `DISCONNECTED - ${hostname}:${port} - ${reference.#host}${
+                            reference.#destroyed ? '' : ` - RETRY[${cooldown}ms`
+                        }]`
+                    );
+
+                    // Do not continue the retry cycle if instance is destroyed
+                    if (reference.#destroyed) return;
+
+                    // Retry the connection uplink after waiting the cooldown milliseconds
+                    if (cooldown > 0) await async_wait(cooldown + 1);
+                    reference.#ws_cooldown = backoff ? cooldown * 2 : cooldown;
+                    reference._initialize_ws_uplink();
+                });
+            });
+
+            // Ensure the pooled connection successfully opened
+            if (this.#ws.readyState === Websocket.OPEN) {
                 // Subscribe to the remote server's events for this host
                 reference.#ws.send(
                     JSON.stringify({
@@ -145,15 +207,15 @@ export default class Mirror extends EventEmitter {
 
                 // Perform a hard sync to ensure all files/directories are in sync
                 if (!is_initial) reference._perform_hard_sync();
-            });
+            }
         } else {
             // Initialize a websocket connection to the remote server
             const reference = this;
             const connection = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}/?auth_key=${auth}`);
             this.#ws = connection;
+            console.log(`[${this.#id}] Initializing ws connection to ${identity}`);
 
-            // Overwrite the pooled connection
-            const old_connection = ws_pool[identity];
+            // Store the ws connection in the ws pool
             ws_pool[identity] = connection;
 
             // Handle the 'open' event
@@ -170,9 +232,6 @@ export default class Mirror extends EventEmitter {
                     })
                 );
 
-                // Recalibrate the old pooled connection
-                if (old_connection) old_connection.emit('recalibrate');
-
                 // Perform a hard sync to ensure all files/directories are in sync
                 if (!is_initial) reference._perform_hard_sync();
             });
@@ -187,13 +246,18 @@ export default class Mirror extends EventEmitter {
                 const cooldown = reference.#ws_cooldown || every;
                 reference._log(
                     'WEBSOCKET',
-                    `DISCONNECTED - ${hostname}:${port} - ${this.#host} - RETRY[${cooldown}ms]`
+                    `DISCONNECTED - ${hostname}:${port} - ${reference.#host}${
+                        reference.#destroyed ? '' : ` - RETRY[${cooldown}ms`
+                    }]`
                 );
-                await async_wait(cooldown);
 
-                // Retry the connection uplink
-                this.#ws_cooldown = backoff ? cooldown * 2 : cooldown;
-                reference._initialize_ws_uplink();
+                // Do not continue the retry cycle if instance is destroyed
+                if (reference.#destroyed) return;
+
+                // Retry the connection uplink after waiting the cooldown milliseconds
+                if (cooldown > 0) await async_wait(cooldown);
+                reference.#ws_cooldown = backoff ? cooldown * 2 : cooldown;
+                reference._initialize_ws_uplink(false);
             });
         }
 
@@ -493,5 +557,15 @@ export default class Mirror extends EventEmitter {
             stream
         );
         this._log('UPLOAD', `${uri} - FILE - ${Date.now() - start_time}ms`);
+    }
+
+    /* Mirror Instance Getters */
+
+    /**
+     * Returns whether this mirror instance is destroyed.
+     * @returns {Boolean}
+     */
+    get destroyed() {
+        return this.#destroyed;
     }
 }

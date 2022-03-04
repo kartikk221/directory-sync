@@ -42,6 +42,7 @@ export default class DirectoryMap extends EventEmitter {
     #files = {};
     #directories = {};
     #supressions = {};
+    #destroyed = false;
     #options = {
         path: '',
         filters: {
@@ -136,6 +137,16 @@ export default class DirectoryMap extends EventEmitter {
 
         // Initialize the chokidar watcher instance
         this._initialize_watcher().catch((error) => this.emit('error', error));
+    }
+
+    /**
+     * Destroys this DirectoryMap instance.
+     *
+     * @returns {Promise}
+     */
+    destroy() {
+        this.#destroyed = true;
+        return this.#watcher.close();
     }
 
     #ready_resolve;
@@ -430,6 +441,14 @@ export default class DirectoryMap extends EventEmitter {
     }
 
     /* DirectoryMap Getters */
+
+    /**
+     * Returns whether this DirectoryMap instance is destroyed.
+     * @returns {Boolean}
+     */
+    get destroyed() {
+        return this.#destroyed;
+    }
 
     /**
      * Returns the root path of this DirectoryMap.
