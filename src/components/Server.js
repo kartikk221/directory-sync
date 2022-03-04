@@ -158,6 +158,9 @@ export default class Server extends EventEmitter {
                     message: "Query parameter 'uri' must be a valid string.",
                 });
 
+            // Retrieve the Directory Map record for this uri
+            const record = map.get(uri);
+
             // Match the incoming request to one of the supported operations
             let body;
             let operation;
@@ -166,7 +169,7 @@ export default class Server extends EventEmitter {
             switch (request.method) {
                 case 'GET':
                     // Ensure that the uri has a valid record in our map
-                    if (map.get(uri) === undefined)
+                    if (record === undefined)
                         return response.status(404).json({
                             code: 'NOT_FOUND',
                             message: 'No record exists for the specified uri.',
@@ -222,7 +225,7 @@ export default class Server extends EventEmitter {
 
                 // If the output of the operation is a readable stream, pipe it as the response
                 if (output instanceof Stream.Readable) {
-                    return output.pipe(response.writable);
+                    return response.stream(output, record.stats.size);
                 } else {
                     // Send a 'SUCCESS' code response with any output as that data
                     return response.json({
