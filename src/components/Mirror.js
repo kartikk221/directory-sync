@@ -2,6 +2,7 @@ import fetch from 'node-fetch';
 import Path from 'path';
 import Stream from 'stream';
 import Websocket from 'ws';
+import JustQueue from 'just-queue';
 import FileSystem from 'fs/promises';
 import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
@@ -36,6 +37,7 @@ export default class Mirror extends EventEmitter {
     #map;
     #host;
     #manager;
+    #network_queue;
     #destroyed = false;
     #options = {
         path: '',
@@ -46,6 +48,13 @@ export default class Mirror extends EventEmitter {
         retry: {
             every: 1000,
             backoff: true,
+        },
+        network_queue: {
+            concurrent: 1,
+            throttle: {
+                rate: 10,
+                interval: 1000,
+            },
         },
     };
 
@@ -65,6 +74,17 @@ export default class Mirror extends EventEmitter {
         this.#id = randomUUID();
         this.#host = host;
         wrap_object(this.#options, options);
+
+        // Initialize the network queue with provided options
+        const { concurrent, throttle } = this.#options.network_queue;
+        const { rate, interval } = throttle;
+        this.#network_queue = new JustQueue({
+            max_concurrent: concurrent,
+            throttle: {
+                rate,
+                interval,
+            },
+        });
 
         // Initialize local actors
         this._initialize_actors();
@@ -459,18 +479,21 @@ export default class Mirror extends EventEmitter {
         // Safely make the HTTP request
         let response;
         try {
-            response = await fetch(
-                `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}&actor=${actor}${
-                    uri ? `&uri=${encodeURIComponent(uri)}` : ''
-                }`,
-                {
-                    method,
-                    headers: {
-                        ...headers,
-                        'x-auth-key': auth,
-                    },
-                    body,
-                }
+            // Queue the HTTP request in the Network Queue to prevent extensive backpressure
+            response = await this.#network_queue.queue(() =>
+                fetch(
+                    `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}&actor=${actor}${
+                        uri ? `&uri=${encodeURIComponent(uri)}` : ''
+                    }`,
+                    {
+                        method,
+                        headers: {
+                            ...headers,
+                            'x-auth-key': auth,
+                        },
+                        body,
+                    }
+                )
             );
 
             // Check if we received a 403 to alert the user
@@ -490,11 +513,14 @@ export default class Mirror extends EventEmitter {
             }
 
             // Retry the request if there are some retries remaining
-            const { delay, backoff } = this.#options.retry;
+            const { every, backoff } = this.#options.retry;
 
             // Wait for the retry delay if one is provided
-            const cooldown = retry_delay || delay;
-            if (cooldown) await async_wait(cooldown);
+            const cooldown = retry_delay || every;
+            if (cooldown) {
+                this._log('HTTP', `ERROR - ${method} - ${error.message}`);
+                await async_wait(cooldown);
+            }
 
             // Retry the request with the updated cooldown
             return await this._http_request(method, uri, headers, body, backoff ? cooldown * 2 : cooldown);
