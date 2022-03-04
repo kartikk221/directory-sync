@@ -165,7 +165,6 @@ export default class Mirror extends EventEmitter {
         if (pooling && ws_pool[identity]) {
             // Re-use the shared ws connection
             this.#ws = ws_pool[identity];
-            console.log(`[${this.#id}] Re-using shared ws connection to ${identity}`);
 
             // Wait for the pooled connection to either open or close
             await new Promise((resolve) => {
@@ -233,7 +232,6 @@ export default class Mirror extends EventEmitter {
             const reference = this;
             const connection = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}/?auth_key=${auth}`);
             this.#ws = connection;
-            console.log(`[${this.#id}] Initializing ws connection to ${identity}`);
 
             // Store the ws connection in the ws pool
             ws_pool[identity] = connection;
