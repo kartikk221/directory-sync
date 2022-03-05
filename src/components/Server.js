@@ -352,6 +352,7 @@ export default class Server extends EventEmitter {
             `events/${identifier}`,
             JSON.stringify({
                 command: 'MUTATION',
+                host,
                 uri,
                 md5,
                 type,

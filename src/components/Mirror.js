@@ -278,8 +278,11 @@ export default class Mirror extends EventEmitter {
                 switch (message.command) {
                     case 'MUTATION':
                         // Handle the incoming mutation event
-                        const { type, uri, md5, is_directory } = message;
-                        return reference._handle_remote_mutation(type, uri, md5, is_directory);
+                        const { host, type, uri, md5, is_directory } = message;
+
+                        // Ensure the incoming event is for this host as we may be sharing the websocket connection
+                        if (this.#host === host) reference._handle_remote_mutation(type, uri, md5, is_directory);
+                        break;
                 }
         });
     }
