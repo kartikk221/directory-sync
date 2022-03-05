@@ -27,6 +27,8 @@ import {
  * @property {Object} filters - The detection filters to apply to the directory tree.
  * @property {FilteringObject|FilteringFunction} filters.keep - Only files satisfying these filter(s) will be loaded into the Directory Tree.
  * @property {FilteringObject|FilteringFunction} filters.ignore - Files statisfying these filter(s) will NOT be loaded into the Directory Tree.
+ * @property {Object} limits - The limit constants for this Directory Map.
+ * @property {Number} limits.max_file_size - The maximum file size in bytes.
  * @property {Chokidar.WatchOptions} watcher - The watcher options to use when watching the directory tree.
  */
 
@@ -55,6 +57,9 @@ export default class DirectoryMap extends EventEmitter {
                 pollInterval: 100,
                 stabilityThreshold: 500,
             },
+        },
+        limits: {
+            max_file_size: 1024 * 1024 * 100,
         },
     };
 
@@ -392,11 +397,19 @@ export default class DirectoryMap extends EventEmitter {
      */
     async _on_file_add(path, stats, is_change = false) {
         // Generate the MD5 hash for this file
-        stats.md5 = await generate_md5_hash(path);
+        stats.md5 = stats.size > 0 ? await generate_md5_hash(path) : '';
 
         // Retrieve the relative path to the directory
         const object = this._object_stats(path, stats);
         if (object) {
+            // Ensure the file size is less than the maximum file size limit
+            const { max_file_size } = this.#options.limits;
+            if (max_file_size && stats.size > max_file_size) {
+                // Ensure we cleanup any existing record if the file size is too large
+                if (this.#files[object.uri]) delete this.#files[object.uri];
+                return this.emit('file_size_limit', object.uri, object);
+            }
+
             // Expire schema & store the object by the relative path aka uri
             this.#schema = null;
             this.#files[object.uri] = object;
@@ -405,6 +418,10 @@ export default class DirectoryMap extends EventEmitter {
             const event = is_change ? 'file_change' : 'file_create';
             if (!this._depress(object.uri, event, 1)) this.emit(event, object.uri, object);
         }
+
+        // Emit the 'file_md5' event for any consumers that are listening for a md5 change
+        // Do not supress this event as it is used for file integrity checks by consumers
+        this.emit(`md5_change:${object.uri}`, object);
     }
 
     /**
@@ -433,9 +450,6 @@ export default class DirectoryMap extends EventEmitter {
      * @param {FileSystem.Stats} stats
      */
     async _on_file_change(path, stats) {
-        // Update the MD5 hash for this file
-        stats.md5 = stats.size > 0 ? await generate_md5_hash(path) : '';
-
         // Pass through this event to the file add event but as a change event
         this._on_file_add(path, stats, true);
     }

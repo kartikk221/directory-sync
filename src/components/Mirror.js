@@ -15,6 +15,7 @@ import {
     async_for_each,
     async_wait,
     safe_json_parse,
+    generate_md5_hash,
 } from '../utils/operators.js';
 
 // This will hold the shared websocket connections to remote servers
@@ -125,6 +126,17 @@ export default class Mirror extends EventEmitter {
         options.path = this.#options.path;
         this.#map = new DirectoryMap(options);
         this.#manager = new DirectoryManager(this.#map, true);
+
+        // Bind a 'error' handler to pipe errors
+        this.#map.on('error', (error) => this.emit('error', error));
+
+        // Bind a 'file_size_limit' handler to log the event
+        this.#map.on('file_size_limit', (uri, object) =>
+            this._log(
+                'SIZE_LIMIT_REACHED',
+                `${uri} - SIZE_${object.stats.size}_BYTES > LIMIT_${this.#map.options.limits.max_file_size}_BYTES`
+            )
+        );
 
         // Wait for the map to be ready before performing synchronization
         await this.#map.ready();
@@ -548,7 +560,7 @@ export default class Mirror extends EventEmitter {
      * @param {String} uri
      * @returns {Promise<Stream.Readable>}
      */
-    async _download_file(uri) {
+    async _download_file(uri, delay) {
         // Make the HTTP request to retrieve the file stream
         const start_time = Date.now();
         this._log('DOWNLOAD', `${uri} - FILE - START`);
@@ -561,7 +573,26 @@ export default class Mirror extends EventEmitter {
         if (status !== 200) throw new Error(`_download_file(${uri}) -> HTTP ${status}`);
 
         // Stream the file to the local file system if we receive some content else empty the file
-        await this.#manager.write(uri, +headers.get('content-length') === 0 ? '' : body);
+        try {
+            // Supress the indirect_write to prevent an unneccessary upload
+            const expected_md5 = headers.get('md5-hash') || '';
+            await this.#manager.indirect_write(
+                uri,
+                +headers.get('content-length') === 0 ? '' : body,
+                expected_md5,
+                true
+            );
+        } catch (error) {
+            // Wait for the appropriate cooldown delay before retrying download
+            const { every, backoff } = this.#options.retry;
+            const cooldown = delay || every;
+            this._log('DOWNLOAD', `${uri} - FILE - FAILED - RETRY - ${cooldown}ms`);
+            await async_wait(cooldown);
+
+            // Retry the download with the updated cooldown
+            return await this._download_file(uri, backoff ? cooldown * 2 : cooldown);
+        }
+
         this._log('DOWNLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start_time}ms`);
     }
 
@@ -570,7 +601,7 @@ export default class Mirror extends EventEmitter {
      *
      * @param {String} uri
      */
-    async _upload_file(uri) {
+    async _upload_file(uri, delay) {
         // Retrieve a readable stream for the file
         const start_time = Date.now();
         this._log('UPLOAD', `${uri} - FILE - START`);
@@ -578,7 +609,7 @@ export default class Mirror extends EventEmitter {
 
         // Make HTTP request to upload the file
         const { stats } = this.#map.get(uri);
-        await this._http_request(
+        const { status } = await this._http_request(
             'POST',
             uri,
             {
@@ -587,6 +618,23 @@ export default class Mirror extends EventEmitter {
             },
             stream
         );
+
+        // Determine if a retry is required due to delivery failure
+        if (status === 409) {
+            // Wait for the appropriate cooldown delay
+            const { every, backoff } = this.#options.retry;
+            const cooldown = delay || every;
+            this._log('UPLOAD', `${uri} - FILE - FAILED - RETRY - ${cooldown}ms`);
+            await async_wait(cooldown);
+
+            // Retry the upload with the updated cooldown
+            return await this._upload_file(uri, backoff ? cooldown * 2 : cooldown);
+        }
+
+        if (status !== 200)
+            // Ensure the response status code is valid
+            throw new Error(`_upload_file(${uri}) -> HTTP ${status}`);
+
         this._log('UPLOAD', `${uri} - FILE - END - ${Date.now() - start_time}ms`);
     }
 

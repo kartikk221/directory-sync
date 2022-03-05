@@ -11,7 +11,6 @@ import {
     to_forward_slashes,
     safe_json_parse,
     ascii_to_hex,
-    hex_to_ascii,
 } from '../utils/operators.js';
 
 export default class Server extends EventEmitter {
@@ -26,6 +25,10 @@ export default class Server extends EventEmitter {
             passphrase: '',
             dh_params: '',
             prefer_low_memory_usage: false,
+        },
+        limits: {
+            max_body_length: 1024 * 1024 * 100, // 100MB
+            fast_buffers: true,
         },
     };
 
@@ -58,8 +61,8 @@ export default class Server extends EventEmitter {
      * @private
      */
     _initialize_server() {
-        // Spread constructor options for HyperExpress
-        const { port, ssl } = this.#options;
+        // Spread constructor options for HyperExpress Server instance
+        const { port, ssl, limits } = this.#options;
         const { key, cert, passphrase, dh_params, prefer_low_memory_usage } = ssl;
 
         // Create a new HyperExpress.Server instance
@@ -70,9 +73,12 @@ export default class Server extends EventEmitter {
                 passphrase: passphrase,
                 dh_params_file_name: dh_params,
                 ssl_prefer_low_memory_usage: prefer_low_memory_usage,
+                ...limits,
             });
         } else {
-            this.#server = new HyperExpress.Server();
+            this.#server = new HyperExpress.Server({
+                ...limits,
+            });
         }
 
         // Bind server global uncaught error handler to emitter
@@ -129,6 +135,7 @@ export default class Server extends EventEmitter {
         this.#server.any('/', async (request, response) => {
             // Destructure various path/query parameters
             let { uri, host } = request.query_parameters;
+            const content_length = +request.headers['content-length'] || 0;
 
             // Decode the host/uri url encoded components
             host = decodeURIComponent(host);
@@ -175,17 +182,11 @@ export default class Server extends EventEmitter {
                             message: 'No record exists for the specified uri.',
                         });
 
-                    // Match the incoming file's MD5 hash against local MD5 hash
+                    // Respond with the record's data as a stream or empty
+                    // Include the md5-hash of the record's content if it exists
                     descriptor = 'UPLOAD';
-                    const local_md5 = record.stats.md5;
-                    const incoming_md5 = request.headers['md5-hash'];
-                    if (local_md5 === incoming_md5) {
-                        // If the MD5 hash matches, return a dummy resolved Promise as this was a no-op
-                        operation = 'CHECKSUM_MATCH';
-                    } else {
-                        // Retrieve a readable stream for the specified uri
-                        operation = record.stats.size > 0 ? manager.read(uri, true) : '';
-                    }
+                    request.headers['md5-hash'] = record.stats.md5;
+                    operation = record.stats.size > 0 ? manager.read(uri, true) : '';
                     break;
                 case 'PUT':
                     // Parse the JSON body to analyze the uri record
@@ -197,8 +198,18 @@ export default class Server extends EventEmitter {
                     break;
                 case 'POST':
                     descriptor = 'DOWNLOAD';
-                    const content_length = +request.headers['content-length'] || 0;
-                    operation = manager.write(uri, content_length == 0 ? '' : request.stream);
+
+                    // Do not write to the file system if the incoming md5 is the same as the local md5
+                    const incoming_md5 = request.headers['md5-hash'];
+                    const local_md5 = record.stats.md5;
+                    if (incoming_md5 === local_md5) {
+                        // Mark the operation as complete with an empty response
+                        operation = '';
+                        break;
+                    }
+
+                    // Consume the incoming stream if we have some content else empty the file
+                    operation = manager.indirect_write(uri, content_length == 0 ? '' : request.stream, incoming_md5);
                     break;
                 case 'DELETE':
                     descriptor = 'DELETE';
@@ -211,6 +222,7 @@ export default class Server extends EventEmitter {
                 // Safely retrieve the output from the operation by awaiting if it is a promise
                 let output;
                 try {
+                    // Safely derive an output from the operation
                     const start_time = Date.now();
                     output = operation instanceof Promise ? await operation : operation;
 
@@ -221,9 +233,16 @@ export default class Server extends EventEmitter {
                         `${request.ip} - '${host}' - ${uri}${execution_time > 0 ? ` - ${execution_time}ms` : ''}`
                     );
                 } catch (error) {
-                    // Return the request with the error message
+                    // Return a 409 HTTP status code to signify that the operation failed
+                    if (error.message === 'ERR_FILE_WRITE_INTEGRITY_CHECK_FAILED')
+                        return response.status(409).json({
+                            code: 'DELIVERY_FAILED',
+                            message: 'The file integrity check failed. Please re-upload the file.',
+                        });
+
+                    // Return a 500 HTTP status code to signify a server error
                     return response.status(500).json({
-                        code: 'INTERNAL_ERROR',
+                        code: 'SERVER_ERROR',
                         message: 'An uncaught error DirectoryManager error occured.',
                         error: error?.message,
                     });
@@ -307,13 +326,34 @@ export default class Server extends EventEmitter {
         if (!(await is_accessible_path(path)))
             throw new Error(`DirectorySync.Server.host(name, path) -> The provided path ${path} is not accessible`);
 
+        // Initialize the file size limit if user has not provided one
+        const server_max_length = this.#options.limits.max_body_length;
+        if (options?.limits?.max_file_size == undefined)
+            options.limits = {
+                max_file_size: server_max_length,
+            };
+
+        // Ensure the provided or specified max_file_size limit does not exceed the server max_body_length limit
+        if ((options.limits.max_file_size || 0) > server_max_length)
+            throw new Error(
+                "DirectorySync.Server.host(name, path, options) -> The provided max_file_size limit exceeds the server's max_body_length."
+            );
+
         // Create a new DirectoryMap instance for this host
         options.path = path;
         const map = new DirectoryMap(options);
         const manager = new DirectoryManager(map, false);
 
-        // Bind a error handler to pass through any errors
+        // Bind a 'error' handler to pass through any errors
         map.on('error', (error) => this.emit('error', error));
+
+        // Bind a 'file_size_limit' handler to log the event
+        map.on('file_size_limit', (uri, object) =>
+            this._log(
+                'SIZE_LIMIT_REACHED',
+                `${uri} - SIZE_${object.stats.size}_BYTES > LIMIT_${map.options.limits.max_file_size}_BYTES`
+            )
+        );
 
         // Wait for the DirectoryMap to be ready
         await map.ready();
