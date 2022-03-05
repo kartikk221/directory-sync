@@ -2,12 +2,12 @@ import fetch from 'node-fetch';
 import Path from 'path';
 import Stream from 'stream';
 import Websocket from 'ws';
+import JustQueue from 'just-queue';
 import FileSystem from 'fs/promises';
 import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
 
-import { randomUUID } from 'crypto';
 import {
     wrap_object,
     to_forward_slashes,
@@ -31,10 +31,10 @@ const ws_pool = {};
 );
 
 export default class Mirror extends EventEmitter {
-    #id;
     #ws;
     #map;
     #host;
+    #queue;
     #manager;
     #destroyed = false;
     #options = {
@@ -46,6 +46,15 @@ export default class Mirror extends EventEmitter {
         retry: {
             every: 1000,
             backoff: true,
+        },
+        queue: {
+            max_concurrent: 10,
+            max_queued: Infinity,
+            timeout: Infinity,
+            throttle: {
+                rate: Infinity,
+                interval: Infinity,
+            },
         },
     };
 
@@ -61,10 +70,12 @@ export default class Mirror extends EventEmitter {
         if (options === null || typeof options !== 'object')
             throw new Error('new DirectorySync.Mirror(options) -> options must be an object');
 
-        // Initialize the mirror instance with unique uuid identifier for actor matching
-        this.#id = randomUUID();
+        // Initialize the mirror instance
         this.#host = host;
         wrap_object(this.#options, options);
+
+        // Initialize the network queue
+        this.#queue = new JustQueue(this.#options.queue);
 
         // Initialize local actors
         this._initialize_actors();
@@ -267,8 +278,8 @@ export default class Mirror extends EventEmitter {
                 switch (message.command) {
                     case 'MUTATION':
                         // Handle the incoming mutation event
-                        const { actor, type, uri, is_directory } = message;
-                        return reference._handle_remote_mutation(actor, type, uri, is_directory);
+                        const { type, uri, md5, is_directory } = message;
+                        return reference._handle_remote_mutation(type, uri, md5, is_directory);
                 }
         });
     }
@@ -319,31 +330,37 @@ export default class Mirror extends EventEmitter {
     /**
      * Handles incoming remote MUTATION command to synchronize remote->local.
      *
-     * @param {String} actor
      * @param {('CREATE'|'MODIFIED'|'DELETE')} type
      * @param {String} uri
+     * @param {String} md5
      * @param {Boolean} is_directory
      */
-    async _handle_remote_mutation(actor, type, uri, is_directory = true) {
+    async _handle_remote_mutation(type, uri, md5, is_directory = true) {
         // Handle mutation event if it's actor id does not match the self id
-        if (this.#id !== actor)
-            switch (type) {
-                case 'CREATE':
-                    // Create the directory/file with local manager
-                    this.#manager.create(uri, is_directory);
-                    this._log('CREATE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
-                    break;
-                case 'MODIFIED':
-                    // Download the file from remote as it has been modified
-                    this._log('MODIFIED', `${uri} - SERVER - FILE`);
-                    this._download_file(uri);
-                    break;
-                case 'DELETE':
-                    // Delete the directory/file with local manager
-                    this.#manager.delete(uri, is_directory);
-                    this._log('DELETE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
-                    break;
-            }
+        switch (type) {
+            case 'CREATE':
+                // Create the directory/file with local manager
+                this.#manager.create(uri, is_directory);
+                this._log('CREATE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
+                break;
+            case 'MODIFIED':
+                // Compare the incoming md5 with the local md5
+                const record = this.#map.get(uri);
+                if (record) {
+                    // If the local_md5 matches incoming md5, skip the mutation
+                    const local_md5 = record.stats.md5;
+                    if (local_md5 === md5) return;
+                }
+
+                // Download the file from remote as it has been modified
+                this._download_file(uri);
+                break;
+            case 'DELETE':
+                // Delete the directory/file with local manager
+                this.#manager.delete(uri, is_directory);
+                this._log('DELETE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
+                break;
+        }
     }
 
     /**
@@ -433,7 +450,7 @@ export default class Mirror extends EventEmitter {
             next();
         });
 
-        // Wait for all promises to resolve
+        // Wait for all promises to resolve if we have some promises
         if (promises.length > 0) await Promise.all(promises);
 
         // Emit a completion log
@@ -452,25 +469,26 @@ export default class Mirror extends EventEmitter {
      */
     async _http_request(method, uri, headers, body, retry_delay) {
         // Destructure options to retrive constructor options
-        const actor = this.#id;
         const { hostname, port, ssl, auth } = this.#options;
 
         // Safely make the HTTP request
         let response;
         try {
             // Queue the HTTP request in the Network Queue to prevent extensive backpressure
-            response = await fetch(
-                `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}&actor=${actor}${
-                    uri ? `&uri=${encodeURIComponent(uri)}` : ''
-                }`,
-                {
-                    method,
-                    headers: {
-                        ...headers,
-                        'x-auth-key': auth,
-                    },
-                    body,
-                }
+            response = await this.#queue.queue(() =>
+                fetch(
+                    `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}${
+                        uri ? `&uri=${encodeURIComponent(uri)}` : ''
+                    }`,
+                    {
+                        method,
+                        headers: {
+                            ...headers,
+                            'x-auth-key': auth,
+                        },
+                        body,
+                    }
+                )
             );
 
             // Check if we received a 403 to alert the user
@@ -533,6 +551,9 @@ export default class Mirror extends EventEmitter {
         this._log('DOWNLOAD', `${uri} - FILE - START`);
         const { status, body, headers } = await this._http_request('GET', uri);
 
+        // Perform a follow-up hard sync if we recieve a 404 after retry delay
+        if (status === 404) return this._log('DOWNLOAD', `${uri} - FILE - 404`);
+
         // Ensure the response status code is valid
         if (status !== 200) throw new Error(`_download_file(${uri}) -> HTTP ${status}`);
 
@@ -559,6 +580,7 @@ export default class Mirror extends EventEmitter {
             uri,
             {
                 'content-length': stats.size.toString(),
+                'md5-hash': stats.md5,
             },
             stream
         );

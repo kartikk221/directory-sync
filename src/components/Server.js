@@ -128,7 +128,7 @@ export default class Server extends EventEmitter {
         // Create the global catch-all HTTP route
         this.#server.any('/', async (request, response) => {
             // Destructure various path/query parameters
-            let { uri, host, actor } = request.query_parameters;
+            let { uri, host } = request.query_parameters;
 
             // Decode the host/uri url encoded components
             host = decodeURIComponent(host);
@@ -175,9 +175,17 @@ export default class Server extends EventEmitter {
                             message: 'No record exists for the specified uri.',
                         });
 
-                    // Retrieve a readable stream for the specified uri
+                    // Match the incoming file's MD5 hash against local MD5 hash
                     descriptor = 'UPLOAD';
-                    operation = record.stats.size > 0 ? manager.read(uri, true) : '';
+                    const local_md5 = record.stats.md5;
+                    const incoming_md5 = request.headers['md5-hash'];
+                    if (local_md5 === incoming_md5) {
+                        // If the MD5 hash matches, return a dummy resolved Promise as this was a no-op
+                        operation = 'CHECKSUM_MATCH';
+                    } else {
+                        // Retrieve a readable stream for the specified uri
+                        operation = record.stats.size > 0 ? manager.read(uri, true) : '';
+                    }
                     break;
                 case 'PUT':
                     // Parse the JSON body to analyze the uri record
@@ -207,7 +215,11 @@ export default class Server extends EventEmitter {
                     output = operation instanceof Promise ? await operation : operation;
 
                     // Log the operation if it has a mutation descriptor
-                    this._log(descriptor, `${request.ip} - '${host}' - ${uri} - ${Date.now() - start_time}ms`);
+                    const execution_time = Date.now() - start_time;
+                    this._log(
+                        descriptor,
+                        `${request.ip} - '${host}' - ${uri}${execution_time > 0 ? ` - ${execution_time}ms` : ''}`
+                    );
                 } catch (error) {
                     // Return the request with the error message
                     return response.status(500).json({
@@ -216,13 +228,6 @@ export default class Server extends EventEmitter {
                         error: error?.message,
                     });
                 }
-
-                // Publish a mutation event if this operation causes a mutation
-                /* if (descriptor !== 'UPLOAD') {
-                    const identifier = ascii_to_hex(host);
-                    const mutation = descriptor === 'DOWNLOAD' ? 'MODIFIED' : descriptor;
-                    setTimeout(() => this._publish_mutation(identifier, actor, mutation, uri, is_directory), 0);
-                } */
 
                 // GET requests are only used to consume data thus we must only send output
                 if (request.method === 'GET') {
@@ -327,58 +332,56 @@ export default class Server extends EventEmitter {
     /**
      * Publishes a mutation event to all websocket consumers for the specified host identifier.
      *
-     * @param {String} identifier
-     * @param {String} actor
-     * @param {('CREATE'|'MODIFIED'|'DELETE')} type
+     * @param {String} host
      * @param {String} uri
+     * @param {('CREATE'|'MODIFIED'|'DELETE')} type
      * @param {Boolean} is_directory
      */
-    _publish_mutation(identifier, actor, type, uri, is_directory = true) {
-        // Log the mutation if it is from the server
-        if (actor === 'SERVER')
-            this._log(
-                'MUTATION',
-                `'${hex_to_ascii(identifier)}' - ${type} - ${uri} - ${is_directory ? 'DIRECTORY' : 'FILE'}`
-            );
+    _publish_mutation(host, uri, type, is_directory = true) {
+        let md5 = '';
+        if (type !== 'DELETE') {
+            // Attempt to destructure and retrieve md5 from the uri record
+            const { map } = this.#hosts[host];
+            const record = map.get(uri);
+            if (record) md5 = record.stats.md5 || '';
+        }
 
         // Emit a 'mutation' event with the provided type, uri, and is_directory
+        const identifier = ascii_to_hex(host);
         this.#server.publish(
             `events/${identifier}`,
             JSON.stringify({
                 command: 'MUTATION',
-                actor,
-                type,
                 uri,
+                md5,
+                type,
                 is_directory,
             })
         );
     }
 
     /**
-     * Binds handlers to the host map for emitting mutationst.
+     * Binds handlers to the host map for emitting mutations.
      *
      * @private
      * @param {String} host
      * @param {DirectoryMap} map
      */
     _bind_mutation_emitters(host, map) {
-        // Destructure the DirectoryMap instance from the host record
-        const identifier = ascii_to_hex(host);
-
         // Bind a 'directory_create' handler to publish mutations
-        map.on('directory_create', (uri) => this._publish_mutation(identifier, 'SERVER', 'CREATE', uri, true));
+        map.on('directory_create', (uri) => this._publish_mutation(host, uri, 'CREATE', true));
 
         // Bind a 'directory_delete' handler to publish mutations
-        map.on('directory_delete', (uri) => this._publish_mutation(identifier, 'SERVER', 'DELETE', uri, true));
+        map.on('directory_delete', (uri) => this._publish_mutation(host, uri, 'DELETE', true));
 
         // Bind a 'file_create' handler to publish mutations
-        map.on('file_create', (uri) => this._publish_mutation(identifier, 'SERVER', 'CREATE', uri, false));
+        map.on('file_create', (uri) => this._publish_mutation(host, uri, 'CREATE', false));
 
         // Bind a 'file_change' handler to publish mutations
-        map.on('file_change', (uri) => this._publish_mutation(identifier, 'SERVER', 'MODIFIED', uri, false));
+        map.on('file_change', (uri) => this._publish_mutation(host, uri, 'MODIFIED', false));
 
         // Bind a 'file_delete' handler to publish mutations
-        map.on('file_delete', (uri) => this._publish_mutation(identifier, 'SERVER', 'DELETE', uri, false));
+        map.on('file_delete', (uri) => this._publish_mutation(host, uri, 'DELETE', false));
     }
 
     /**
