@@ -203,7 +203,7 @@ export default class Server extends EventEmitter {
 
                     // Do not write to the file system if the incoming md5 is the same as the local md5
                     const incoming_md5 = request.headers['md5-hash'];
-                    const local_md5 = record.stats.md5;
+                    const local_md5 = record?.stats?.md5;
                     if (incoming_md5 === local_md5) {
                         // Mark the operation as complete with an empty response
                         operation = '';

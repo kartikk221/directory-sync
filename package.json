@@ -27,7 +27,7 @@
     "homepage": "https://github.com/kartikk221/directory-sync#readme",
     "dependencies": {
         "chokidar": "^3.5.3",
-        "hyper-express": "^5.8.3",
+        "hyper-express": "^5.8.5",
         "just-queue": "^1.0.1",
         "node-fetch": "^3.2.0",
         "ws": "^8.5.0"
