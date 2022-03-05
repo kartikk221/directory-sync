@@ -1,6 +1,6 @@
 {
     "name": "directory-sync",
-    "version": "2.0.7",
+    "version": "2.0.8",
     "description": "Easily synchronize directories between two machines over the internet.",
     "main": "index.js",
     "type": "module",
