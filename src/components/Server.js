@@ -177,7 +177,7 @@ export default class Server extends EventEmitter {
 
                     // Retrieve a readable stream for the specified uri
                     descriptor = 'UPLOAD';
-                    operation = manager.read(uri, true);
+                    operation = record.stats.size > 0 ? manager.read(uri, true) : '';
                     break;
                 case 'PUT':
                     // Parse the JSON body to analyze the uri record
@@ -189,7 +189,8 @@ export default class Server extends EventEmitter {
                     break;
                 case 'POST':
                     descriptor = 'DOWNLOAD';
-                    operation = manager.write(uri, request.stream);
+                    const content_length = +request.headers['content-length'] || 0;
+                    operation = manager.write(uri, content_length == 0 ? '' : request.stream);
                     break;
                 case 'DELETE':
                     descriptor = 'DELETE';
@@ -198,7 +199,7 @@ export default class Server extends EventEmitter {
             }
 
             // Determine if we were able to successfully map the request to an operation
-            if (operation) {
+            if (operation !== undefined) {
                 // Safely retrieve the output from the operation by awaiting if it is a promise
                 let output;
                 try {
@@ -217,17 +218,22 @@ export default class Server extends EventEmitter {
                 }
 
                 // Publish a mutation event if this operation causes a mutation
-                if (descriptor !== 'UPLOAD') {
+                /* if (descriptor !== 'UPLOAD') {
                     const identifier = ascii_to_hex(host);
                     const mutation = descriptor === 'DOWNLOAD' ? 'MODIFIED' : descriptor;
-                    this._publish_mutation(identifier, actor, mutation, uri, is_directory);
-                }
+                    setTimeout(() => this._publish_mutation(identifier, actor, mutation, uri, is_directory), 0);
+                } */
 
-                // If the output of the operation is a readable stream, pipe it as the response
-                if (output instanceof Stream.Readable) {
-                    return response.stream(output, record.stats.size);
+                // GET requests are only used to consume data thus we must only send output
+                if (request.method === 'GET') {
+                    // If the output of the operation is a readable stream, pipe it as the response
+                    if (output instanceof Stream.Readable) {
+                        return response.stream(output, record.stats.size);
+                    } else {
+                        return response.send(output);
+                    }
                 } else {
-                    // Send a 'SUCCESS' code response with any output as that data
+                    // Send a 'SUCCESS' code response with any output as that data parameter
                     return response.json({
                         code: 'SUCCESS',
                         data: output,
@@ -299,7 +305,7 @@ export default class Server extends EventEmitter {
         // Create a new DirectoryMap instance for this host
         options.path = path;
         const map = new DirectoryMap(options);
-        const manager = new DirectoryManager(map);
+        const manager = new DirectoryManager(map, false);
 
         // Bind a error handler to pass through any errors
         map.on('error', (error) => this.emit('error', error));

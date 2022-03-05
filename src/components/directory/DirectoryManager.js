@@ -4,8 +4,10 @@ import FileSystem from 'fs/promises';
 
 export default class DirectoryManager {
     #map;
-    constructor(map) {
+    #supress_mutations = true;
+    constructor(map, supress_mutations = true) {
         this.#map = map;
+        this.#supress_mutations = supress_mutations;
     }
 
     /**
@@ -29,10 +31,10 @@ export default class DirectoryManager {
         if (!this.#map.get(uri)) {
             const path = this._absolute_path(uri);
             if (is_directory) {
-                this.#map.supress(uri, 'directory_create', 1);
+                if (this.#supress_mutations) this.#map.supress(uri, 'directory_create', 1);
                 return FileSystem.mkdir(path);
             } else {
-                this.#map.supress(uri, 'file_create', 1);
+                if (this.#supress_mutations) this.#map.supress(uri, 'file_create', 1);
                 return FileSystem.writeFile(path, '');
             }
         }
@@ -65,9 +67,9 @@ export default class DirectoryManager {
 
         // Suppress the file_change event if file already exists locally
         if (this.#map.get(uri)) {
-            this.#map.supress(uri, 'file_change', 1);
+            if (this.#supress_mutations) this.#map.supress(uri, 'file_change', 1);
         } else {
-            this.#map.supress(uri, 'file_create', 1);
+            if (this.#supress_mutations) this.#map.supress(uri, 'file_create', 1);
         }
 
         if (data instanceof Stream.Readable) {
@@ -90,7 +92,7 @@ export default class DirectoryManager {
     delete(uri, is_directory = false) {
         if (this.#map.get(uri)) {
             const path = this._absolute_path(uri);
-            this.#map.supress(uri, is_directory ? 'directory_delete' : 'file_delete', 1);
+            if (this.#supress_mutations) this.#map.supress(uri, is_directory ? 'directory_delete' : 'file_delete', 1);
             return new Promise((resolve, reject) =>
                 FileSystem.rm(path, {
                     recursive: true,

@@ -2,7 +2,6 @@ import fetch from 'node-fetch';
 import Path from 'path';
 import Stream from 'stream';
 import Websocket from 'ws';
-import JustQueue from 'just-queue';
 import FileSystem from 'fs/promises';
 import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
@@ -37,7 +36,6 @@ export default class Mirror extends EventEmitter {
     #map;
     #host;
     #manager;
-    #network_queue;
     #destroyed = false;
     #options = {
         path: '',
@@ -48,13 +46,6 @@ export default class Mirror extends EventEmitter {
         retry: {
             every: 1000,
             backoff: true,
-        },
-        network_queue: {
-            concurrent: 1,
-            throttle: {
-                rate: 10,
-                interval: 1000,
-            },
         },
     };
 
@@ -74,17 +65,6 @@ export default class Mirror extends EventEmitter {
         this.#id = randomUUID();
         this.#host = host;
         wrap_object(this.#options, options);
-
-        // Initialize the network queue with provided options
-        const { concurrent, throttle } = this.#options.network_queue;
-        const { rate, interval } = throttle;
-        this.#network_queue = new JustQueue({
-            max_concurrent: concurrent,
-            throttle: {
-                rate,
-                interval,
-            },
-        });
 
         // Initialize local actors
         this._initialize_actors();
@@ -133,7 +113,7 @@ export default class Mirror extends EventEmitter {
         // Initialize a DirectoryMap locally to compare with remote
         options.path = this.#options.path;
         this.#map = new DirectoryMap(options);
-        this.#manager = new DirectoryManager(this.#map);
+        this.#manager = new DirectoryManager(this.#map, true);
 
         // Wait for the map to be ready before performing synchronization
         await this.#map.ready();
@@ -378,6 +358,7 @@ export default class Mirror extends EventEmitter {
         const reference = this;
         const start_time = Date.now();
         const local_schema = this.#map.schema;
+        this._log('HARD_SYNC', `START`);
         if (schema === undefined) {
             // Retrieve remote host map options and schema
             const response = await this._http_request('GET');
@@ -456,7 +437,7 @@ export default class Mirror extends EventEmitter {
         if (promises.length > 0) await Promise.all(promises);
 
         // Emit a completion log
-        this._log('COMPLETE', `HARD_SYNC - ${Date.now() - start_time}ms`);
+        this._log('HARD_SYNC', `COMPLETE - ${Date.now() - start_time}ms`);
     }
 
     /**
@@ -478,20 +459,18 @@ export default class Mirror extends EventEmitter {
         let response;
         try {
             // Queue the HTTP request in the Network Queue to prevent extensive backpressure
-            response = await this.#network_queue.queue(() =>
-                fetch(
-                    `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}&actor=${actor}${
-                        uri ? `&uri=${encodeURIComponent(uri)}` : ''
-                    }`,
-                    {
-                        method,
-                        headers: {
-                            ...headers,
-                            'x-auth-key': auth,
-                        },
-                        body,
-                    }
-                )
+            response = await fetch(
+                `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}&actor=${actor}${
+                    uri ? `&uri=${encodeURIComponent(uri)}` : ''
+                }`,
+                {
+                    method,
+                    headers: {
+                        ...headers,
+                        'x-auth-key': auth,
+                    },
+                    body,
+                }
             );
 
             // Check if we received a 403 to alert the user
@@ -537,8 +516,9 @@ export default class Mirror extends EventEmitter {
         const start_time = Date.now();
         const { stats } = this.#map.get(uri);
         const { created_at, modified_at } = stats;
+        this._log('CREATE', `${uri} - REMOTE_DIRECTORY - START`);
         await this._http_request('PUT', uri, {}, JSON.stringify([created_at, modified_at]));
-        this._log('CREATE', `${uri} - DIRECTORY - ${Date.now() - start_time}ms`);
+        this._log('CREATE', `${uri} - REMOTE_DIRECTORY - ${Date.now() - start_time}ms`);
     }
 
     /**
@@ -550,14 +530,15 @@ export default class Mirror extends EventEmitter {
     async _download_file(uri) {
         // Make the HTTP request to retrieve the file stream
         const start_time = Date.now();
-        const { status, body } = await this._http_request('GET', uri);
+        this._log('DOWNLOAD', `${uri} - FILE - START`);
+        const { status, body, headers } = await this._http_request('GET', uri);
 
         // Ensure the response status code is valid
         if (status !== 200) throw new Error(`_download_file(${uri}) -> HTTP ${status}`);
 
-        // Write the file stream to local directory
-        await this.#manager.write(uri, body);
-        this._log('DOWNLOAD', `${uri} - FILE - ${Date.now() - start_time}ms`);
+        // Stream the file to the local file system if we receive some content else empty the file
+        await this.#manager.write(uri, +headers.get('content-length') === 0 ? '' : body);
+        this._log('DOWNLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start_time}ms`);
     }
 
     /**
@@ -568,6 +549,7 @@ export default class Mirror extends EventEmitter {
     async _upload_file(uri) {
         // Retrieve a readable stream for the file
         const start_time = Date.now();
+        this._log('UPLOAD', `${uri} - FILE - START`);
         const stream = this.#manager.read(uri, true);
 
         // Make HTTP request to upload the file
@@ -580,7 +562,7 @@ export default class Mirror extends EventEmitter {
             },
             stream
         );
-        this._log('UPLOAD', `${uri} - FILE - ${Date.now() - start_time}ms`);
+        this._log('UPLOAD', `${uri} - FILE - END - ${Date.now() - start_time}ms`);
     }
 
     /* Mirror Instance Getters */
