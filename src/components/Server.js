@@ -185,8 +185,10 @@ export default class Server extends EventEmitter {
                     // Respond with the record's data as a stream or empty
                     // Include the md5-hash of the record's content if it exists
                     descriptor = 'UPLOAD';
-                    request.headers['md5-hash'] = record.stats.md5;
                     operation = record.stats.size > 0 ? manager.read(uri, true) : '';
+
+                    // Include the MD5 hash of the record's content if it exists so client can verify
+                    response.header('md5-hash', record.stats.md5);
                     break;
                 case 'PUT':
                     // Parse the JSON body to analyze the uri record
