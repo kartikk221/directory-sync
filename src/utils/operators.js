@@ -57,6 +57,25 @@ function match_extension(name, extension) {
 }
 
 /**
+ * Converts the provided string to a path based uri
+ *
+ * @param {String} string
+ * @returns {String}
+ */
+function to_path_uri(string) {
+    // Add a leading slash if not present
+    string = string.startsWith('/') ? string : `/${string}`;
+
+    // Remove any dual leading slashes
+    string = string.replace(/\/{2,}/g, '/');
+
+    // Remove any trailing slashes
+    string = string.replace(/\/$/, '');
+
+    return string;
+}
+
+/**
  * Converts any backslashes to forward slashes.
  *
  * @param {String} path
@@ -144,6 +163,7 @@ export {
     async_wait,
     async_for_each,
     match_extension,
+    to_path_uri,
     to_forward_slashes,
     is_accessible_path,
     generate_md5_hash,

@@ -5,6 +5,7 @@ import FileSystem from 'fs';
 import {
     wrap_object,
     match_extension,
+    to_path_uri,
     to_forward_slashes,
     is_accessible_path,
     generate_md5_hash,
@@ -91,7 +92,8 @@ export default class DirectoryMap extends EventEmitter {
         const { keep, ignore } = this.#options.filters;
         [keep, ignore].forEach((filter, index) => {
             // Index 0 is "keep" and index 1 is "ignore"
-            const FILTER_TYPE = index === 0 ? 'keep' : 'ignore';
+            // We store the parsed filter functions with "_" prefix to sginify that they are not user-provided
+            const FILTER_TYPE = index === 0 ? '_keep' : '_ignore';
             if (typeof filter == 'function') {
                 // If the filter is a function, use it as is
                 reference.#options.filters[FILTER_TYPE] = filter;
@@ -101,6 +103,10 @@ export default class DirectoryMap extends EventEmitter {
                 const has_files = Array.isArray(files) && files.length > 0;
                 const has_directories = Array.isArray(directories) && directories.length > 0;
                 const has_extensions = Array.isArray(extensions) && extensions.length > 0;
+
+                // Convert files, directories, and extensions to uris
+                const file_uris = has_files ? files.map((file) => to_path_uri(file)) : [];
+                const directory_uris = has_directories ? directories.map((directory) => to_path_uri(directory)) : [];
 
                 // If the filter has names or extensions, use a function to filter the DirectoryMap
                 if (has_files || has_directories || has_extensions)
@@ -116,14 +122,14 @@ export default class DirectoryMap extends EventEmitter {
                             // Only perform below checks if we have some directories to check
                             if (has_directories) {
                                 // If this directory's name matches one of the directory names, return true
-                                if (directories.includes(name)) return true;
+                                if (directory_uris.find((uri) => path.endsWith(uri))) return true;
 
                                 // If strict mode is disabled, check for parent directory matches
                                 if (!strict && chunks.find((parent) => directories.includes(parent))) return true;
                             }
                         } else {
                             // If this file's name matches one of the names, return true
-                            if (has_files && files.includes(name)) return true;
+                            if (has_files && file_uris.find((uri) => path.endsWith(uri))) return true;
 
                             // If this is a file and its extension matches one of the extensions, return true
                             if (has_extensions && extensions.find((ext) => match_extension(name, ext))) return true;
@@ -232,7 +238,7 @@ export default class DirectoryMap extends EventEmitter {
 
         // Inject the top level filter callback into the watcher options
         const reference = this;
-        const { keep, ignore } = this.#options.filters;
+        const { _keep, _ignore } = this.#options.filters;
         watcher.ignored = (path, stats) => {
             // If this execution does not have stats avaialble, ignore it
             if (stats === undefined) return false;
@@ -245,10 +251,10 @@ export default class DirectoryMap extends EventEmitter {
 
             // Assert the "ignore" filter as strict if one is available
             // The "ignore" filter is applied first as it is more restrictive
-            if (typeof ignore == 'function' && ignore(relative, stats, true)) return true;
+            if (typeof _ignore == 'function' && _ignore(relative, stats, true)) return true;
 
             // Assert the "keep" filter as non-strict if one is available
-            if (typeof keep == 'function' && !keep(relative, stats, false)) return true;
+            if (typeof _keep == 'function' && !_keep(relative, stats, false)) return true;
 
             // If this candidate passes above filters, then it is good to be tracked
             return false;
