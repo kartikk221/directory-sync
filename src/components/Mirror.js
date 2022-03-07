@@ -586,6 +586,7 @@ export default class Mirror extends EventEmitter {
             const { every, backoff } = this.#options.retry;
             const cooldown = delay || every;
             this._log('DOWNLOAD', `${uri} - FILE - FAILED - RETRY - ${cooldown}ms`);
+            this.emit('error', error);
             await async_wait(cooldown);
 
             // Retry the download with the updated cooldown
@@ -630,9 +631,8 @@ export default class Mirror extends EventEmitter {
             return await this._upload_file(uri, backoff ? cooldown * 2 : cooldown);
         }
 
-        if (status !== 200)
-            // Ensure the response status code is valid
-            throw new Error(`_upload_file(${uri}) -> HTTP ${status}`);
+        // Ensure the response status code is valid
+        if (status !== 200) throw new Error(`_upload_file(${uri}) -> HTTP ${status}`);
 
         this._log('UPLOAD', `${uri} - FILE - END - ${Date.now() - start_time}ms`);
     }

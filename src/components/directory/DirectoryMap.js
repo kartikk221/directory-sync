@@ -184,6 +184,9 @@ export default class DirectoryMap extends EventEmitter {
      * @returns {Number} The amount of supressions for this uri/event.
      */
     supress(uri, event, amount = 1) {
+        // Ignore temporary uris
+        if (uri.startsWith('temporary://')) return;
+
         // Initialize the supression key or increment the amount of supressions
         const key = `${event}:${uri}`;
         if (!this.#supressions[key]) {

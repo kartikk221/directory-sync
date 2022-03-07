@@ -1,8 +1,12 @@
+import tempDirectoryRaw from 'temp-dir';
 import Stream from 'stream';
 import FileSystemSync from 'fs';
 import FileSystem from 'fs/promises';
 
 import { randomUUID } from 'crypto';
+import { to_forward_slashes, generate_md5_hash } from '../../utils/operators.js';
+
+const SYSTEM_TEMPORARY_PATH = to_forward_slashes(tempDirectoryRaw);
 
 export default class DirectoryManager {
     #map;
@@ -19,7 +23,12 @@ export default class DirectoryManager {
      * @returns {String}
      */
     _absolute_path(uri) {
-        return `${this.#map.path}${uri}`;
+        // Return the temporary directory system path if the uri is a temporary uri
+        if (uri.startsWith('temporary://')) {
+            return `${SYSTEM_TEMPORARY_PATH}${uri.replace('temporary://', '/')}`;
+        } else {
+            return `${this.#map.path}${uri}`;
+        }
     }
 
     /**
@@ -62,11 +71,16 @@ export default class DirectoryManager {
      *
      * @param {String} uri
      * @param {String|Buffer|Stream.Readable} data
-     * @param {String=} md5
+     * @param {String} md5
      * @param {Boolean=} supress
      */
     async write(uri, data, md5, supress) {
         const path = this._absolute_path(uri);
+
+        // Ensure this write operation has an accompanying md5 hash
+        const has_length = data instanceof Stream.Readable || data.length > 0;
+        if (typeof md5 !== 'string' || (has_length && md5.length == 0))
+            throw new Error('MD5 Hash Is Required For Checksum Validation When Writing Content');
 
         // Suppress the file_change event if file already exists locally
         if (this.#map.get(uri)) {
@@ -91,10 +105,13 @@ export default class DirectoryManager {
             // Wait for the filesystem operation to finish
             await promise;
 
-            // Wait for the md5 of this file to update
-            const written_md5 = await new Promise((resolve) =>
-                this.#map.once(`md5_change:${uri}`, ({ stats }) => resolve(stats.md5))
-            );
+            // If this is temporary file, generate the md5 hash from the file path
+            // else wait for the Directory Map to load the new md5 hash
+            const written_md5 = uri.startsWith('temporary://')
+                ? await generate_md5_hash(path)
+                : await new Promise((resolve) =>
+                      this.#map.once(`md5_change:${uri}`, ({ stats }) => resolve(stats.md5))
+                  );
 
             // Throw an error if the md5's do not match
             if (md5 !== written_md5) throw new Error(`ERR_FILE_WRITE_INTEGRITY_CHECK_FAILED`);
@@ -117,7 +134,7 @@ export default class DirectoryManager {
         if (!(data instanceof Stream.Readable) && data.length === 0) return await this.write(uri, data, md5);
 
         // Attempt to write the file safely to a temporary file
-        const temp_uri = `/temp-${randomUUID()}`;
+        const temp_uri = `temporary://temp-${randomUUID()}`;
         try {
             await this.write(temp_uri, data, md5, true);
         } catch (error) {
