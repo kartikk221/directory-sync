@@ -211,7 +211,7 @@ export default class Server extends EventEmitter {
                     }
 
                     // Consume the incoming stream if we have some content else empty the file
-                    operation = manager.indirect_write(uri, content_length == 0 ? '' : request.stream, incoming_md5);
+                    operation = manager.indirect_write(uri, content_length == 0 ? '' : request, incoming_md5);
                     break;
                 case 'DELETE':
                     descriptor = 'DELETE';
