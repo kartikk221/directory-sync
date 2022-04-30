@@ -1,6 +1,6 @@
 {
     "name": "directory-sync",
-    "version": "2.0.13",
+    "version": "2.0.14",
     "description": "Easily synchronize directories between two machines over the internet.",
     "main": "index.js",
     "type": "module",
@@ -27,7 +27,7 @@
     "homepage": "https://github.com/kartikk221/directory-sync#readme",
     "dependencies": {
         "chokidar": "^3.5.3",
-        "hyper-express": "^6.0.0",
+        "hyper-express": "^6.1.1",
         "just-queue": "^1.0.1",
         "node-fetch": "^3.2.0",
         "temp-dir": "^2.0.0",
