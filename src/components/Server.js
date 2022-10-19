@@ -211,7 +211,11 @@ export default class Server extends EventEmitter {
                     }
 
                     // Consume the incoming stream if we have some content else empty the file
-                    operation = manager.indirect_write(uri, content_length == 0 ? '' : request, incoming_md5);
+                    operation = manager.indirect_write(
+                        uri,
+                        !content_length || !request._readable ? '' : request._readable,
+                        incoming_md5
+                    );
                     break;
                 case 'DELETE':
                     descriptor = 'DELETE';
@@ -242,12 +246,8 @@ export default class Server extends EventEmitter {
                             message: 'The file integrity check failed. Please re-upload the file.',
                         });
 
-                    // Return a 500 HTTP status code to signify a server error
-                    return response.status(500).json({
-                        code: 'SERVER_ERROR',
-                        message: 'An uncaught error DirectoryManager error occured.',
-                        error: error?.message,
-                    });
+                    // Throw the error to the global error handler
+                    return response.throw(error);
                 }
 
                 // GET requests are only used to consume data thus we must only send output
