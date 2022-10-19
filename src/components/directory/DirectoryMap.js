@@ -271,9 +271,10 @@ export default class DirectoryMap extends EventEmitter {
         // The ready event should wait for all asynchronous operations to complete
         const promises = [];
         this.#watcher.on('add', (path, stats) => {
-            const promise = this._on_file_add(path, stats);
+            const promise = this._on_file_add(path, stats, stats.size > 0);
             if (reference.#ready_resolve) promises.push(promise);
         });
+
         this.#watcher.on('change', (path, stats) => {
             const promise = this._on_file_change(path, stats);
             if (reference.#ready_resolve) promises.push(promise);

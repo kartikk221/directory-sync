@@ -6,7 +6,7 @@ async function create_mirror(id) {
     const prefix = 'MIRROR-' + id;
     const mirror = new Mirror('source', {
         path: `./mirrored-${id}`,
-        hostname: 'localhost',
+        hostname: '127.0.0.1',
         port: 8080,
         auth: 'development',
     });
