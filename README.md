@@ -1,5 +1,5 @@
 # DirectorySync: Multi-Directional FileSystem Synchronization
-Synchronize directories between multiple machines over network with the ability to be synchronized in real-time. (In Development)
+Synchronize directories between multiple machines over network with the ability to be synchronized in real-time.
 
 ## Installation
 DirectorySync requires Node.js version 14+ and can be installed using Node Package Manager (npm).
