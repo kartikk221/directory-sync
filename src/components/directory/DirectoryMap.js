@@ -53,7 +53,7 @@ export default class DirectoryMap extends EventEmitter {
             ignore: {},
         },
         watcher: {
-            usePolling: true,
+            usePolling: false,
             awaitWriteFinish: {
                 pollInterval: 100,
                 stabilityThreshold: 500,
