@@ -82,11 +82,10 @@ export default class DirectoryManager {
         if (typeof md5 !== 'string' || (has_length && md5.length == 0))
             throw new Error('MD5 Hash Is Required For Checksum Validation When Writing Content');
 
-        // Suppress the file_change event if file already exists locally
-        if (this.#map.get(uri)) {
-            if (supress || this.#supress_mutations) this.#map.supress(uri, 'file_change', 1);
-        } else {
-            if (supress || this.#supress_mutations) this.#map.supress(uri, 'file_create', 1);
+        // Suppress any upcoming file change events for this file
+        if (supress || this.#supress_mutations) {
+            this.#map.supress(to_uri, 'file_change', 1);
+            this.#map.supress(to_uri, 'file_create', 1);
         }
 
         // Begin the filesystem operation with a consumable Promise
@@ -136,7 +135,7 @@ export default class DirectoryManager {
         // Attempt to write the file safely to a temporary file
         const temp_uri = `temporary://temp-${randomUUID()}`;
         try {
-            await this.write(temp_uri, data, md5, true);
+            await this.write(temp_uri, data, md5);
         } catch (error) {
             // Delete the temporary file as we encountered an error
             await this.delete(temp_uri, true);
@@ -159,18 +158,14 @@ export default class DirectoryManager {
         const from_path = this._absolute_path(from_uri);
         const to_path = this._absolute_path(to_uri);
 
-        // Suppress the file_change event if file already exists locally
-        if (this.#map.get(to_uri)) {
-            if (supress || this.#supress_mutations) this.#map.supress(to_uri, 'file_change', 1);
-        } else {
-            if (supress || this.#supress_mutations) this.#map.supress(to_uri, 'file_create', 1);
+        // Suppress any upcoming file change events for this file
+        if (supress || this.#supress_mutations) {
+            this.#map.supress(to_uri, 'file_change', 1);
+            this.#map.supress(to_uri, 'file_create', 1);
         }
 
         // Copy the file from the source to the destination
         await FileSystem.copyFile(from_path, to_path);
-
-        // Suppress the file_delete event from the directory map
-        this.#map.supress(from_uri, 'file_delete', 1);
 
         // Delete the source file
         await FileSystem.rm(from_path, {

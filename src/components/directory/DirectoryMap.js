@@ -89,7 +89,6 @@ export default class DirectoryMap extends EventEmitter {
 
         // Parse the "keep" and "ignore" filter functions into usable functions
         const reference = this;
-        const root_directory = this.#path.split('/').slice(-1)[0];
         const { keep, ignore } = this.#options.filters;
         [keep, ignore].forEach((filter, index) => {
             // Index 0 is "keep" and index 1 is "ignore"
@@ -112,37 +111,71 @@ export default class DirectoryMap extends EventEmitter {
                 // If the filter has names or extensions, use a function to filter the DirectoryMap
                 if (has_files || has_directories || has_extensions)
                     reference.#options.filters[FILTER_TYPE] = (path, stats, strict) => {
-                        // Retrieve the file's name by getting the last slash split chunk
-                        const chunks = path.split('/');
-                        const name = chunks[chunks.length - 1];
-                        const is_root = path === `/${name}`;
+                        // Perform strict matching based on the matchable candidates provided by the filter
                         const is_directory = stats.isDirectory();
-
-                        // Determine if the file is a directory
                         if (is_directory) {
-                            // Only perform below checks if we have some directories to check
+                            // We can only perform strict matching on a directory if we have some directory candidates to match against
                             if (has_directories) {
-                                // If this directory's name matches one of the directory names, return true
+                                // Match one of the directory candidate uris as the ending of the provided path
+                                // This essentially checks if the provided path is of one of the directory candidates
                                 if (directory_uris.find((uri) => path.endsWith(uri))) return true;
 
-                                // If strict mode is disabled, check for parent directory matches
-                                if (!strict && chunks.find((parent) => directories.includes(parent))) return true;
+                                // If we are in non-strict mode, we can perform loose matching with the directory candidates as the parents of the provided path
+                                // This essentially checks if the current path directory is a child in the hierarchy of one of the directory candidates
+                                if (!strict) {
+                                    // Match each directory URI individually as a parent of the provided path
+                                    for (const uri of directory_uris) {
+                                        // URIs don't have trailing slashes so we need to add one to the end of the uri to make this a parent path check
+                                        const [_, right] = path.split(`${uri}/`);
+
+                                        // If we have some content on the right side of the split, then this is a child of the directory candidate
+                                        if (right) return true;
+                                    }
+                                }
                             }
                         } else {
-                            // If this file's name matches one of the names, return true
+                            // Match one of the file candidate uris as the ending of the provided path
+                            // This essentially checks if the provided path is of one of the file candidates
                             if (has_files && file_uris.find((uri) => path.endsWith(uri))) return true;
 
-                            // If this is a file and its extension matches one of the extensions, return true
-                            if (has_extensions && extensions.find((ext) => match_extension(name, ext))) return true;
-
-                            // If this is a root file and we have directories to check for this filter
-                            // We must handle the scenario where root files are ONLY allowed if the root directory is allowed
-                            if (is_root && has_directories) return directories.includes(root_directory);
+                            // Match one of the extension candidate uris as the ending of the provided path
+                            // This essentially checks if the file at provided path is of one of the extension candidates
+                            if (has_extensions) {
+                                const name = path.split('/').slice(-1)[0];
+                                if (extensions.find((extension) => match_extension(name, extension))) return true;
+                            }
                         }
 
-                        // If strict mode is enabled, always return false as this is a strict filter
-                        // If strict mode is disabled, return true ONLY if none of the above conditions were checked for
-                        return strict ? false : is_directory ? !has_directories : !has_files && !has_extensions;
+                        // Match one of the directory candidates as parent paths of the provided path
+                        // This essentially prevents sub-directories and sub-files of a directory candidate from not being matched
+                        if (has_directories) {
+                            // Match each directory URI individually as a parent of the provided path
+                            for (const uri of directory_uris) {
+                                // URIs don't have trailing slashes so we need to add one to the end of the uri to make this a parent path check
+                                const [_, right] = path.split(`${uri}/`);
+
+                                // If we have some content on the right side of the split, then this is a child of the directory candidate
+                                if (right) return true;
+                            }
+                        }
+
+                        // At this point, none of the targeting filters from before matched this resource
+                        // Let's attempt to do loose matching if strict matching is not required
+                        if (strict) {
+                            // Since strict matching is required, we can return false immediately without performing any loose matching
+                            return false;
+                        } else {
+                            // Perform loose matching based on the matchable candidates provided by the filter
+                            if (is_directory) {
+                                // If this is a directory and the filter has not matchable directory candidates than this filter loosely matches everything
+                                // Hence we can return a true match if the filter has no directory candidates to match against
+                                return !has_directories;
+                            } else {
+                                // If this is a file and the filter has no matchable file or extension candidates than this filter loosely matches everything
+                                // Hence we can return a true match if the filter has no file or extension candidates to match against
+                                return !has_files && !has_extensions;
+                            }
+                        }
                     };
             }
         });
@@ -241,20 +274,20 @@ export default class DirectoryMap extends EventEmitter {
         const reference = this;
         const { _keep, _ignore } = this.#options.filters;
         watcher.ignored = (path, stats) => {
-            // If this execution does not have stats avaialble, ignore it
+            // If this execution does not have stats avaialble then we cannot filter it hence we allow it
             if (stats === undefined) return false;
 
-            // Always allow the root path to prevent premature traversal halt
+            // Always ignore the root path from being filtered
             if (path === reference.#path) return false;
 
             // Extrapolate the relative path for filtering this file/directory
             const relative = reference._relative_uri(path);
 
             // Assert the "ignore" filter as strict if one is available
-            // The "ignore" filter is applied first as it is more restrictive
+            // The "ignore" filter is applied first as it is more restrictive and takes precedence over the "keep" filter
             if (typeof _ignore == 'function' && _ignore(relative, stats, true)) return true;
 
-            // Assert the "keep" filter as non-strict if one is available
+            // Assert the "keep" filter and return true to filter this file/directory if it fails
             if (typeof _keep == 'function' && !_keep(relative, stats, false)) return true;
 
             // If this candidate passes above filters, then it is good to be tracked
@@ -361,6 +394,17 @@ export default class DirectoryMap extends EventEmitter {
     }
 
     /**
+     * Asserts whether the provided path and stats are ignored by the watcher.
+     *
+     * @param {String} path
+     * @param {FileSystem.Stats} stats
+     * @returns {boolean}
+     */
+    _is_watcher_ignored(path, stats) {
+        return this.#options.watcher.ignored(path, stats);
+    }
+
+    /**
      * Handles the watcher directory create event.
      *
      * @private
@@ -368,6 +412,9 @@ export default class DirectoryMap extends EventEmitter {
      * @param {FileSystem.Stats} stats
      */
     _on_directory_create(path, stats) {
+        // Assert the watcher ignored on this directory
+        if (this._is_watcher_ignored(path, stats)) return;
+
         // Retrieve the relative path to the directory
         const object = this._object_stats(path, stats);
         if (object) {
@@ -387,6 +434,9 @@ export default class DirectoryMap extends EventEmitter {
      * @param {String} path
      */
     _on_directory_delete(path) {
+        // Assert the watcher ignored on this directory
+        if (this._is_watcher_ignored(path, stats)) return;
+
         // Retrieve the relative path to the directory
         const relative_uri = this._relative_uri(path);
 
@@ -407,6 +457,9 @@ export default class DirectoryMap extends EventEmitter {
      * @param {Boolean} is_change
      */
     async _on_file_add(path, stats, is_change = false) {
+        // Assert the watcher ignored on this file
+        if (this._is_watcher_ignored(path, stats)) return;
+
         // Generate the MD5 hash for this file
         stats.md5 = stats.size > 0 ? await generate_md5_hash(path) : '';
 
@@ -442,6 +495,9 @@ export default class DirectoryMap extends EventEmitter {
      * @param {String} path
      */
     _on_file_delete(path) {
+        // Assert the watcher ignored on this file
+        if (this._is_watcher_ignored(path, stats)) return;
+
         // Retrieve the relative path to the directory
         const relative_uri = this._relative_uri(path);
 
