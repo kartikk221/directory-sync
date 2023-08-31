@@ -84,8 +84,8 @@ export default class DirectoryManager {
 
         // Suppress any upcoming file change events for this file
         if (supress || this.#supress_mutations) {
-            this.#map.supress(to_uri, 'file_change', 1);
-            this.#map.supress(to_uri, 'file_create', 1);
+            this.#map.supress(path, 'file_change', 1);
+            this.#map.supress(path, 'file_create', 1);
         }
 
         // Begin the filesystem operation with a consumable Promise

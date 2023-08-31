@@ -42,6 +42,7 @@ import {
 export default class DirectoryMap extends EventEmitter {
     #path;
     #watcher;
+    #cleanup;
     #files = {};
     #directories = {};
     #supressions = {};
@@ -182,6 +183,9 @@ export default class DirectoryMap extends EventEmitter {
 
         // Initialize the chokidar watcher instance
         this._initialize_watcher().catch((error) => this.emit('error', error));
+
+        // Initialize the cleanup interval to cleanup supressions
+        this.#cleanup = setInterval(() => this._cleanup_supressions(), 1000 * 60);
     }
 
     /**
@@ -191,6 +195,7 @@ export default class DirectoryMap extends EventEmitter {
      */
     destroy() {
         this.#destroyed = true;
+        clearInterval(this.#cleanup);
         return this.#watcher.close();
     }
 
@@ -216,6 +221,20 @@ export default class DirectoryMap extends EventEmitter {
     }
 
     /**
+     * Cleans up expired supressions from the supressions map.
+     * @private
+     * @param {number} max_age_ms
+     */
+    _cleanup_supressions(max_age_ms = 1000) {
+        // Cleanup any supressions that are older than the max age
+        const now = Date.now();
+        for (const key in this.#supressions) {
+            const { updated_at } = this.#supressions[key];
+            if (now - updated_at > max_age_ms) delete this.#supressions[key];
+        }
+    }
+
+    /**
      * Supresses a future event from being emitted on a uri.
      *
      * @param {String} uri
@@ -230,9 +249,13 @@ export default class DirectoryMap extends EventEmitter {
         // Initialize the supression key or increment the amount of supressions
         const key = `${event}:${uri}`;
         if (!this.#supressions[key]) {
-            this.#supressions[key] = amount;
+            this.#supressions[key] = {
+                amount,
+                updated_at: Date.now(),
+            };
         } else {
-            this.#supressions[key] += amount;
+            this.#supressions[key].amount += amount;
+            this.#supressions[key].updated_at = Date.now();
         }
         return this.#supressions[key];
     }
@@ -250,8 +273,8 @@ export default class DirectoryMap extends EventEmitter {
         // Decrement the amount of supressions and delete if it is less than 1
         const key = `${event}:${uri}`;
         if (this.#supressions[key]) {
-            this.#supressions[key] -= amount;
-            if (this.#supressions[key] < 1) delete this.#supressions[key];
+            this.#supressions[key].amount -= amount;
+            if (this.#supressions[key].amount < 1) delete this.#supressions[key];
             return true;
         }
         return false;
