@@ -420,7 +420,7 @@ export default class DirectoryMap extends EventEmitter {
      * Asserts whether the provided path and stats are ignored by the watcher.
      *
      * @param {String} path
-     * @param {FileSystem.Stats} stats
+     * @param {FileSystem.Stats=} stats
      * @returns {boolean}
      */
     _is_watcher_ignored(path, stats) {
@@ -458,7 +458,7 @@ export default class DirectoryMap extends EventEmitter {
      */
     _on_directory_delete(path) {
         // Assert the watcher ignored on this directory
-        if (this._is_watcher_ignored(path, stats)) return;
+        if (this._is_watcher_ignored(path)) return;
 
         // Retrieve the relative path to the directory
         const relative_uri = this._relative_uri(path);
@@ -519,7 +519,7 @@ export default class DirectoryMap extends EventEmitter {
      */
     _on_file_delete(path) {
         // Assert the watcher ignored on this file
-        if (this._is_watcher_ignored(path, stats)) return;
+        if (this._is_watcher_ignored(path)) return;
 
         // Retrieve the relative path to the directory
         const relative_uri = this._relative_uri(path);
