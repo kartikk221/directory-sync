@@ -444,7 +444,15 @@ export default class Mirror extends EventEmitter {
                 if (local_record) {
                     // Determine if the MD5 hash of the local file matches the remote file
                     const [l_md5, l_cat, l_mat] = local_record;
-                    if (l_md5 !== r_md5) sync_direction = l_cat < r_cat || l_mat < r_mat ? -1 : 1;
+                    if (l_md5 !== r_md5) {
+                        // Give priority to the modified at timestamp if the MD5 hashes do not match
+                        // Fall back to created at timestamp if modified at timestamp is not available as it is less accurate but is a last resort
+                        if (l_mat && r_mat) {
+                            sync_direction = l_mat < r_mat ? -1 : 1;
+                        } else if (l_cat && r_cat) {
+                            sync_direction = l_cat < r_cat ? -1 : 1;
+                        }
+                    }
                 }
 
                 // Perform the sync operation
