@@ -210,12 +210,11 @@ export default class Server extends EventEmitter {
                         break;
                     }
 
+                    // This will initialize the body stream under the hood for hyper-express which is neccessary to access _readable
+                    request.isPaused();
+
                     // Consume the incoming stream if we have some content else empty the file
-                    operation = manager.indirect_write(
-                        uri,
-                        !content_length || !request._readable ? '' : request._readable,
-                        incoming_md5
-                    );
+                    operation = manager.indirect_write(uri, !content_length ? '' : request._readable, incoming_md5);
                     break;
                 case 'DELETE':
                     descriptor = 'DELETE';
