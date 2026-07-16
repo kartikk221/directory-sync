@@ -1,451 +1,415 @@
-import Path from 'path';
-import Stream from 'stream';
-import EventEmitter from 'events';
+import EventEmitter from 'node:events';
+import Path from 'node:path';
 import HyperExpress from 'hyper-express';
 import DirectoryMap from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
-
 import {
-    wrap_object,
-    is_accessible_path,
-    to_forward_slashes,
-    safe_json_parse,
+    ACTOR_HEADER,
+    AUTH_HEADER,
+    HASH_HEADER,
+    MODIFIED_HEADER,
+    PROTOCOL_HEADER,
+    PROTOCOL_VERSION,
+} from '../constants.js';
+import {
     ascii_to_hex,
+    canonicalize_uri,
+    compare_entries,
+    constant_time_equal,
+    is_accessible_path,
+    merge_options,
+    safe_json_parse,
+    validate_entry,
 } from '../utils/operators.js';
 
+const DEFAULT_OPTIONS = {
+    port: 8080,
+    auth: '',
+    ssl: {
+        key: '',
+        cert: '',
+        passphrase: '',
+        dh_params: '',
+        prefer_low_memory_usage: false,
+    },
+    limits: { max_body_length: 100 * 1024 * 1024, fast_buffers: true },
+};
+
+/**
+ * Central authority for one or more named repositories.
+ *
+ * Every mutation is validated against the authority's canonical entry before it
+ * reaches disk. Newer mtimes win; exact ties retain the authority's entry. Once
+ * committed, the canonical entry is published to subscribed mirrors.
+ *
+ * @extends EventEmitter
+ */
 export default class Server extends EventEmitter {
+    #destroy_promise;
+    #destroyed = false;
+    #hosts = Object.create(null);
+    #options;
+    #ready_promise;
     #server;
-    #hosts = {};
-    #options = {
-        port: 8080,
-        auth: '',
-        ssl: {
-            key: '',
-            cert: '',
-            passphrase: '',
-            dh_params: '',
-            prefer_low_memory_usage: false,
-        },
-        limits: {
-            max_body_length: 1024 * 1024 * 100, // 100MB
-            fast_buffers: true,
-        },
-    };
+    #websockets = new Set();
 
-    constructor(options = this.#options) {
-        // Initialize the Event Emitter instance
+    /**
+     * Creates and immediately starts a DirectorySync server.
+     *
+     * @param {import('../../index.js').ServerOptions} [options={}] HTTP, TLS, authentication, and body-limit options.
+     */
+    constructor(options = {}) {
         super();
-
-        // Wrap default options object with provided options
-        if (options === null || typeof options !== 'object')
-            throw new Error('new DirectorySync.Server(options) -> options must be an object');
-        wrap_object(this.#options, options);
-
-        // Initialize the underlying HyperExpress webserver
+        if (!options || typeof options !== 'object')
+            throw new TypeError('new DirectorySync.Server(options) -> options must be an object.');
+        this.#options = merge_options(DEFAULT_OPTIONS, options);
+        if (!Number.isInteger(this.#options.port) || this.#options.port < 0 || this.#options.port > 65_535)
+            throw new TypeError('Server port must be an integer between 0 and 65535.');
+        if (typeof this.#options.auth !== 'string') throw new TypeError('Server auth must be a string.');
         this._initialize_server();
     }
 
-    /**
-     * Emits a 'log' event with the specified code/message.
-     *
-     * @private
-     * @param {String} code
-     * @param {String} message
-     */
+    /** @protected @param {string} code Log category. @param {string} message Human-readable detail. @returns {void} */
     _log(code, message) {
         this.emit('log', code, message);
     }
 
-    /**
-     * Initializes the underlying HyperExpress webserver to power this server instance.
-     * @private
-     */
     _initialize_server() {
-        // Spread constructor options for HyperExpress Server instance
         const { port, ssl, limits } = this.#options;
-        const { key, cert, passphrase, dh_params, prefer_low_memory_usage } = ssl;
+        // DirectorySync owns shutdown explicitly. Disabling HyperExpress auto-close
+        // prevents hidden process listeners and lets destroy() close maps first.
+        const common = { ...limits, auto_close: false };
+        this.#server = ssl.key && ssl.cert
+            ? new HyperExpress.Server({
+                  ...common,
+                  key_file_name: ssl.key,
+                  cert_file_name: ssl.cert,
+                  passphrase: ssl.passphrase,
+                  dh_params_file_name: ssl.dh_params,
+                  ssl_prefer_low_memory_usage: ssl.prefer_low_memory_usage,
+              })
+            : new HyperExpress.Server(common);
 
-        // Create a new HyperExpress.Server instance
-        if (key && cert) {
-            this.#server = new HyperExpress.Server({
-                key_file_name: key,
-                cert_file_name: cert,
-                passphrase: passphrase,
-                dh_params_file_name: dh_params,
-                ssl_prefer_low_memory_usage: prefer_low_memory_usage,
-                ...limits,
-            });
-        } else {
-            this.#server = new HyperExpress.Server({
-                ...limits,
-            });
-        }
-
-        // Bind server global uncaught error handler to emitter
-        const reference = this;
         this.#server.set_error_handler((request, response, error) => {
-            reference.emit('error', error, request);
-            return response.status(500).json({
-                code: 'UNCAUGHT_ERROR',
-                message: 'An uncaught error occured while processing your request.',
+            this.emit('error', error, request);
+            if (!response.completed)
+                return response.status(500).json({ code: 'UNCAUGHT_ERROR', message: 'Request failed.' });
+        });
+        this._bind_routes();
+        this.#ready_promise = this.#server.listen(port).then(() => {
+            this._log('STARTUP', `Server started on port ${this.#server.port}`);
+            return this;
+        });
+        this.#ready_promise.catch((error) => this.emit('error', error));
+    }
+
+    _protocol(request, response) {
+        response.header(PROTOCOL_HEADER, String(PROTOCOL_VERSION));
+        if (!constant_time_equal(request.headers[AUTH_HEADER] || '', this.#options.auth)) {
+            response.status(403).json({ code: 'UNAUTHORIZED', message: 'Invalid authentication key.' });
+            return false;
+        }
+        if (String(request.headers[PROTOCOL_HEADER] || '') !== String(PROTOCOL_VERSION)) {
+            response.status(426).json({
+                code: 'PROTOCOL_MISMATCH',
+                message: `DirectorySync protocol v${PROTOCOL_VERSION} is required.`,
             });
-        });
-
-        // Bind the appropriate middlewares & communication routes
-        this._bind_authentication_middleware();
-        this._bind_http_route();
-        this._bind_ws_route();
-
-        // Listen on specified user port
-        this.#server
-            .listen(port)
-            .then(() => this._log('STARTUP', `Server started on port ${port}`))
-            .catch((error) => this.emit('error', error));
+            return false;
+        }
+        return true;
     }
 
-    /**
-     * Binds global authentication middleware to authenticate all incoming network requests.
-     * @private
-     */
-    _bind_authentication_middleware() {
-        // Bind the global middleware for network authentication
-        const auth_key = this.#options.auth;
-        this.#server.use((request, response, next) => {
-            // Retrieve the incoming request's authorization key
-            const incoming_key = request.headers['x-auth-key'] || request.query_parameters['auth_key'] || '';
-
-            // Process request based on whether request is authenticated
-            if (auth_key === incoming_key) {
-                return next();
-            } else {
-                return response.status(403).json({
-                    code: 'UNAUTHORIZED',
-                    message: 'Please provide a valid authentication key.',
-                });
-            }
-        });
+    _host(request, response) {
+        const name = request.query_parameters?.host;
+        const hosted = typeof name === 'string' ? this.#hosts[name] : undefined;
+        if (!hosted) {
+            response.status(404).json({ code: 'INVALID_HOST', message: `Unknown synchronized host '${name || ''}'.` });
+            return undefined;
+        }
+        return { name, ...hosted };
     }
 
-    /**
-     * Binds the master HTTP route which will handle all incoming communications.
-     * @private
-     */
-    _bind_http_route() {
-        // Create the global catch-all HTTP route
-        this.#server.any('/', async (request, response) => {
-            // Destructure various path/query parameters
-            let { uri, host } = request.query_parameters;
-            const content_length = +request.headers['content-length'] || 0;
-
-            // Decode the host/uri url encoded components
-            host = decodeURIComponent(host);
-            if (uri) uri = decodeURIComponent(uri);
-
-            // Ensure that the incoming request maps to a valid host
-            if (typeof host !== 'string' || this.#hosts[host] == undefined)
-                return response.status(404).json({
-                    code: 'INVALID_HOST',
-                    message: `The specified host '${typeof host == 'string' ? host : ''}' is invalid.`,
-                });
-
-            // Return the schema of the map for this host if no uri is provided
-            const { manager, map } = this.#hosts[host];
-            if (uri === undefined) {
-                this._log('SCHEMA', `'${host}' - ${request.ip}`);
-                return response.json({
-                    options: map.options,
-                    schema: map.schema,
-                });
-            }
-
-            // If uri is provided, ensure it is a valid string
-            if (typeof uri !== 'string' || uri.length == 0)
-                return response.status(400).json({
-                    code: 'INVALID_URI',
-                    message: "Query parameter 'uri' must be a valid string.",
-                });
-
-            // Retrieve the Directory Map record for this uri
-            const record = map.get(uri);
-
-            // Match the incoming request to one of the supported operations
-            let body;
-            let operation;
-            let descriptor;
-            let is_directory = false;
-            switch (request.method) {
-                case 'GET':
-                    // Ensure that the uri has a valid record in our map
-                    if (record === undefined)
-                        return response.status(404).json({
-                            code: 'NOT_FOUND',
-                            message: 'No record exists for the specified uri.',
-                        });
-
-                    // Respond with the record's data as a stream or empty
-                    // Include the md5-hash of the record's content if it exists
-                    descriptor = 'UPLOAD';
-                    operation = record.stats.size > 0 ? manager.read(uri, true) : '';
-
-                    // Include the MD5 hash of the record's content if it exists so client can verify
-                    response.header('md5-hash', record.stats.md5);
-                    break;
-                case 'PUT':
-                    // Parse the JSON body to analyze the uri record
-                    // Records with only two properties are directories
-                    descriptor = 'CREATE';
-                    body = await request.json();
-                    is_directory = body.length === 2;
-                    operation = manager.create(uri, is_directory);
-                    break;
-                case 'POST':
-                    descriptor = 'DOWNLOAD';
-
-                    // Do not write to the file system if the incoming md5 is the same as the local md5
-                    const incoming_md5 = request.headers['md5-hash'];
-                    const local_md5 = record?.stats?.md5;
-                    if (incoming_md5 === local_md5) {
-                        // Mark the operation as complete with an empty response
-                        operation = '';
-                        break;
-                    }
-
-                    // This will initialize the body stream under the hood for hyper-express which is neccessary to access _readable
-                    request.isPaused();
-
-                    // Consume the incoming stream if we have some content else empty the file
-                    operation = manager.indirect_write(uri, !content_length ? '' : request._readable, incoming_md5);
-                    break;
-                case 'DELETE':
-                    descriptor = 'DELETE';
-                    operation = manager.delete(uri);
-                    break;
-            }
-
-            // Determine if we were able to successfully map the request to an operation
-            if (operation !== undefined) {
-                // Safely retrieve the output from the operation by awaiting if it is a promise
-                let output;
-                try {
-                    // Safely derive an output from the operation
-                    const start_time = Date.now();
-                    output = operation instanceof Promise ? await operation : operation;
-
-                    // Log the operation if it has a mutation descriptor
-                    const execution_time = Date.now() - start_time;
-                    this._log(
-                        descriptor,
-                        `${request.ip} - '${host}' - ${uri}${execution_time > 0 ? ` - ${execution_time}ms` : ''}`
-                    );
-                } catch (error) {
-                    // Return a 409 HTTP status code to signify that the operation failed
-                    if (error.message === 'ERR_FILE_WRITE_INTEGRITY_CHECK_FAILED')
-                        return response.status(409).json({
-                            code: 'DELIVERY_FAILED',
-                            message: 'The file integrity check failed. Please re-upload the file.',
-                        });
-
-                    // Throw the error to the global error handler
-                    return response.throw(error);
-                }
-
-                // GET requests are only used to consume data thus we must only send output
-                if (request.method === 'GET') {
-                    // If the output of the operation is a readable stream, pipe it as the response
-                    if (output instanceof Stream.Readable) {
-                        return response.stream(output, record.stats.size);
-                    } else {
-                        return response.send(output);
-                    }
-                } else {
-                    // Send a 'SUCCESS' code response with any output as that data parameter
-                    return response.json({
-                        code: 'SUCCESS',
-                        data: output,
-                    });
-                }
-            } else {
-                // The request was an unsupported HTTP method
-                return response.status(405).json({
-                    code: 'UNSUPPORTED_METHOD',
-                    message: `The HTTP method '${request.method}' is not supported.`,
-                });
-            }
-        });
+    _uri(request, response) {
+        try {
+            return canonicalize_uri(request.query_parameters?.uri);
+        } catch (error) {
+            response.status(422).json({ code: 'INVALID_URI', message: error.message });
+            return undefined;
+        }
     }
 
-    /**
-     * Binds the master WebSocket route which will handle all incoming websocket communications.
-     * @private
-     */
-    _bind_ws_route() {
-        // Create the global catch-all WebSocket route
-        // We do not need to authenticate this endpoint as the global middleware will authenticate
-        const reference = this;
-        this.#server.ws('/', (ws) => {
-            reference._log('WEBSOCKET', `CONNECTED - ${ws.ip}`);
-
-            // Bind a 'message' handler to handle incoming messages
-            ws.on('message', (message) => {
-                // Safely parse the incoming message as JSON
-                message = safe_json_parse(message);
-                if (message)
-                    switch (message.command) {
-                        case 'SUBSCRIBE':
-                            // Subscribe to the specified host in hexadecimal format
-                            const topic = `events/${ascii_to_hex(message.host)}`;
-                            if (!ws.is_subscribed(topic)) {
-                                reference._log('WEBSOCKET', `SUBSCRIBED - ${ws.ip} - '${message.host}'`);
-                                ws.subscribe(topic);
-                            }
-                            break;
-                    }
-            });
-
-            // Bind a 'close' handler to handle disconnections
-            ws.on('close', () => {
-                reference._log('WEBSOCKET', `DISCONNECTED - ${ws.ip}`);
-            });
-        });
+    _actor(request) {
+        const actor = request.headers[ACTOR_HEADER];
+        return typeof actor === 'string' && actor.length <= 128 ? actor : 'anonymous';
     }
 
-    /**
-     *
-     * @param {String} name
-     * @param {String} path
-     * @param {import('../components/directory/DirectoryMap').DirectoryMapOptions} options
-     */
-    async host(name, path, options = {}) {
-        // Check if a host with the provided name already exists
-        if (this.#hosts[name])
-            throw new Error(`DirectorySync.Server.host(name) -> A host with name ${name} already exists`);
+    _canonical_response(response, hosted, uri, code = 'STALE_MUTATION') {
+        return response.status(409).json({ code, entry: hosted.map.canonical_entry(uri) || null });
+    }
 
-        // Translate the user provided path into an absolute system path
-        path = to_forward_slashes(Path.resolve(path));
+    _handle_error(response, error, hosted, uri) {
+        if (error.code === 'SIZE_LIMIT')
+            return response.status(413).json({ code: error.code, message: error.message });
+        if (error.code === 'STALE_MUTATION') return this._canonical_response(response, hosted, uri);
+        if (['CHECKSUM', 'INVALID_SIZE', 'INVALID_URI', 'TYPE_CONFLICT', 'CONTENT_REQUIRED'].includes(error.code))
+            return response.status(422).json({ code: error.code, message: error.message });
+        if (error instanceof SyntaxError || error instanceof TypeError)
+            return response.status(422).json({ code: 'INVALID_PAYLOAD', message: error.message });
+        throw error;
+    }
 
-        // Ensure the provided path is a valid directory
-        if (!(await is_accessible_path(path)))
-            throw new Error(`DirectorySync.Server.host(name, path) -> The provided path ${path} is not accessible`);
-
-        // Initialize the file size limit if user has not provided one
-        const server_max_length = this.#options.limits.max_body_length;
-        if (options?.limits?.max_file_size == undefined)
-            options.limits = {
-                max_file_size: server_max_length,
-            };
-
-        // Ensure the provided or specified max_file_size limit does not exceed the server max_body_length limit
-        if ((options.limits.max_file_size || 0) > server_max_length)
-            throw new Error(
-                "DirectorySync.Server.host(name, path, options) -> The provided max_file_size limit exceeds the server's max_body_length."
-            );
-
-        // Create a new DirectoryMap instance for this host
-        options.path = path;
-        const map = new DirectoryMap(options);
-        const manager = new DirectoryManager(map, false);
-
-        // Bind a 'error' handler to pass through any errors
-        map.on('error', (error) => this.emit('error', error));
-
-        // Bind a 'file_size_limit' handler to log the event
-        map.on('file_size_limit', (uri, object) =>
-            this._log(
-                'SIZE_LIMIT_REACHED',
-                `${uri} - SIZE_${object.stats.size}_BYTES > LIMIT_${map.options.limits.max_file_size}_BYTES`
-            )
-        );
-
-        // Wait for the DirectoryMap to be ready
-        await map.ready();
-
-        // Bind mutation emitters for this host
-        this._bind_mutation_emitters(name, map);
-
-        // Create a record for this host instance
-        this.#hosts[name] = {
-            path,
-            map,
-            manager,
+    _route(handler) {
+        // Every data route shares the same protocol/authentication/host gate so a
+        // handler can operate only on a validated HostedDirectory record.
+        return async (request, response) => {
+            if (!this._protocol(request, response)) return;
+            const hosted = this._host(request, response);
+            if (!hosted) return;
+            try {
+                return await handler.call(this, request, response, hosted);
+            } catch (error) {
+                const uri = request.query_parameters?.uri;
+                return this._handle_error(response, error, hosted, uri);
+            }
         };
     }
 
-    /**
-     * Publishes a mutation event to all websocket consumers for the specified host identifier.
-     *
-     * @param {String} host
-     * @param {String} uri
-     * @param {('CREATE'|'MODIFIED'|'DELETE')} type
-     * @param {Boolean} is_directory
-     */
-    _publish_mutation(host, uri, type, is_directory = true) {
-        let md5 = '';
-        if (type !== 'DELETE') {
-            // Attempt to destructure and retrieve md5 from the uri record
-            const { map } = this.#hosts[host];
-            const record = map.get(uri);
-            if (record) md5 = record.stats.md5 || '';
-        }
-
-        // Emit a 'mutation' event with the provided type, uri, and is_directory
-        const identifier = ascii_to_hex(host);
-        this.#server.publish(
-            `events/${identifier}`,
-            JSON.stringify({
-                command: 'MUTATION',
-                host,
-                uri,
-                md5,
-                type,
-                is_directory,
+    _bind_routes() {
+        this.#server.any('/', (request, response) =>
+            response.status(426).json({
+                code: 'PROTOCOL_MISMATCH',
+                message: 'This server uses DirectorySync protocol v3. Upgrade both peers.',
             })
+        );
+
+        this.#server.get('/v3/manifest', this._route(async (request, response, hosted) => {
+            this._log('SCHEMA', `'${hosted.name}' - ${request.ip}`);
+            return response.json({
+                protocol: PROTOCOL_VERSION,
+                options: hosted.map.serializable_options,
+                manifest: hosted.map.manifest,
+                schema: hosted.map.schema,
+            });
+        }));
+
+        this.#server.get('/v3/content', this._route(async (request, response, hosted) => {
+            const uri = this._uri(request, response);
+            if (!uri) return;
+            const entry = hosted.map.canonical_entry(uri);
+            if (!entry) return response.status(404).json({ code: 'NOT_FOUND' });
+            if (entry.type !== 'file')
+                return response.status(422).json({ code: 'NOT_A_FILE', message: 'Content routes only accept files.' });
+            response.header(MODIFIED_HEADER, String(entry.modified_at));
+            response.header(HASH_HEADER, entry.sha256);
+            response.header('content-length', String(entry.size));
+            return response.stream(hosted.manager.read(uri, true), entry.size);
+        }));
+
+        this.#server.put('/v3/content', this._route(async (request, response, hosted) => {
+            const uri = this._uri(request, response);
+            if (!uri) return;
+            if (!hosted.map.allows(uri, 'file'))
+                return response.status(422).json({ code: 'FILTERED', message: 'The authority filters this file.' });
+            const entry = {
+                type: 'file',
+                modified_at: Number(request.headers[MODIFIED_HEADER]),
+                size: Number(request.headers['content-length']),
+                sha256: request.headers[HASH_HEADER],
+            };
+            validate_entry(entry);
+            if (entry.size > this.#options.limits.max_body_length)
+                return response.status(413).json({ code: 'SIZE_LIMIT' });
+            const current = hosted.map.canonical_entry(uri);
+            // compare_entries is intentionally authority-oriented: a negative result
+            // means the existing server entry wins, including exact timestamp ties.
+            const comparison = compare_entries(current, entry);
+            if (comparison < 0) return this._canonical_response(response, hosted, uri);
+            if (comparison === 0) return response.json({ code: 'SUCCESS', entry: current });
+            if (
+                current?.type === 'file' &&
+                current.size === entry.size &&
+                current.sha256 === entry.sha256
+            ) await hosted.manager.apply_metadata(uri, entry);
+            else await hosted.manager.apply_file(uri, entry.size ? request : '', entry, {
+                validate_before_commit: () => compare_entries(hosted.map.canonical_entry(uri), entry) >= 0,
+            });
+            this._publish_mutation(hosted.name, uri, entry, this._actor(request));
+            return response.json({ code: 'SUCCESS', entry });
+        }));
+
+        this.#server.patch('/v3/content', this._route(async (request, response, hosted) => {
+            const uri = this._uri(request, response);
+            if (!uri) return;
+            const entry = await request.json();
+            validate_entry(entry);
+            if (entry.type !== 'file') throw new TypeError('Expected a file entry.');
+            const current = hosted.map.canonical_entry(uri);
+            const comparison = compare_entries(current, entry);
+            if (comparison < 0) return this._canonical_response(response, hosted, uri);
+            if (comparison > 0) {
+                await hosted.manager.apply_metadata(uri, entry);
+                this._publish_mutation(hosted.name, uri, entry, this._actor(request));
+            }
+            return response.json({ code: 'SUCCESS', entry });
+        }));
+
+        this.#server.put('/v3/directory', this._route(async (request, response, hosted) => {
+            const uri = this._uri(request, response);
+            if (!uri) return;
+            if (!hosted.map.allows(uri, 'directory'))
+                return response.status(422).json({ code: 'FILTERED', message: 'The authority filters this directory.' });
+            const entry = await request.json();
+            validate_entry(entry);
+            if (entry.type !== 'directory') throw new TypeError('Expected a directory entry.');
+            const comparison = compare_entries(hosted.map.canonical_entry(uri), entry);
+            if (comparison < 0) return this._canonical_response(response, hosted, uri);
+            if (comparison > 0) {
+                await hosted.manager.apply_directory(uri, entry);
+                this._publish_mutation(hosted.name, uri, entry, this._actor(request));
+            }
+            return response.json({ code: 'SUCCESS', entry });
+        }));
+
+        this.#server.delete('/v3/entry', this._route(async (request, response, hosted) => {
+            const uri = this._uri(request, response);
+            if (!uri) return;
+            const entry = await request.json();
+            validate_entry(entry);
+            if (entry.type !== 'tombstone') throw new TypeError('Expected a tombstone entry.');
+            if (!hosted.map.allows(uri, entry.target))
+                return response.status(422).json({ code: 'FILTERED', message: 'The authority filters this entry.' });
+            const comparison = compare_entries(hosted.map.canonical_entry(uri), entry);
+            if (comparison < 0) return this._canonical_response(response, hosted, uri);
+            if (comparison === 0) return response.json({ code: 'SUCCESS', entry });
+            const applied = await hosted.manager.apply_tombstone(uri, entry);
+            this._publish_mutation(hosted.name, uri, applied, this._actor(request));
+            return response.json({ code: 'SUCCESS', entry: applied });
+        }));
+
+        this.#server.ws('/v3/events', (ws) => {
+            this.#websockets.add(ws);
+            this._log('WEBSOCKET', `CONNECTED - ${ws.ip}`);
+            ws.on('message', (raw) => {
+                const message = safe_json_parse(String(raw));
+                if (message?.command !== 'SUBSCRIBE' || !this.#hosts[message.host]) return;
+                const topic = `events/${ascii_to_hex(message.host)}`;
+                if (!ws.is_subscribed(topic)) ws.subscribe(topic);
+                // The acknowledgment forms a subscription barrier. Mirrors reconcile
+                // after receiving it, so mutations cannot disappear between the HTTP
+                // manifest fetch and WebSocket subscription establishment.
+                ws.send(JSON.stringify({
+                    command: 'SUBSCRIBED',
+                    protocol: PROTOCOL_VERSION,
+                    host: message.host,
+                }));
+            });
+            ws.on('error', (error) => this.emit('error', error));
+            ws.on('close', () => {
+                this.#websockets.delete(ws);
+                this._log('WEBSOCKET', `DISCONNECTED - ${ws.ip}`);
+            });
+        });
+        this.#server.upgrade('/v3/events', (request, response) => {
+            if (!this._protocol(request, response)) return;
+            return response.upgrade({ actor: this._actor(request) });
+        });
+    }
+
+    _publish_mutation(host, uri, entry, actor = 'server') {
+        if (!this.#hosts[host]) return;
+        this.#server.publish(
+            `events/${ascii_to_hex(host)}`,
+            JSON.stringify({ command: 'MUTATION', protocol: PROTOCOL_VERSION, host, uri, entry, actor })
         );
     }
 
     /**
-     * Binds handlers to the host map for emitting mutations.
+     * Hosts a synchronized directory under a unique authority name.
      *
-     * @private
-     * @param {String} host
-     * @param {DirectoryMap} map
+     * @param {string} name Repository name used by Mirror instances.
+     * @param {string} path Local directory that acts as the central authority.
+     * @param {import('../../index.js').DirectoryMapOptions} [options={}] Filters, watcher, state, hash, and size options.
+     * @returns {Promise<import('../../index.js').HostedDirectory>} The live hosted-directory record.
      */
-    _bind_mutation_emitters(host, map) {
-        // Bind a 'directory_create' handler to publish mutations
-        map.on('directory_create', (uri) => this._publish_mutation(host, uri, 'CREATE', true));
+    async host(name, path, options = {}) {
+        await this.ready();
+        if (this.#destroyed) throw new Error('DirectorySync.Server has been destroyed.');
+        if (typeof name !== 'string' || !name)
+            throw new TypeError('DirectorySync.Server.host(name) -> name must be a non-empty string.');
+        if (this.#hosts[name]) throw new Error(`A host with name '${name}' already exists.`);
+        const root = Path.resolve(path);
+        if (!(await is_accessible_path(root, { directory: true })))
+            throw new Error(`The provided path is not an accessible directory: ${root}`);
 
-        // Bind a 'directory_delete' handler to publish mutations
-        map.on('directory_delete', (uri) => this._publish_mutation(host, uri, 'DELETE', true));
-
-        // Bind a 'file_create' handler to publish mutations
-        map.on('file_create', (uri) => this._publish_mutation(host, uri, 'CREATE', false));
-
-        // Bind a 'file_change' handler to publish mutations
-        map.on('file_change', (uri) => this._publish_mutation(host, uri, 'MODIFIED', false));
-
-        // Bind a 'file_delete' handler to publish mutations
-        map.on('file_delete', (uri) => this._publish_mutation(host, uri, 'DELETE', false));
+        const map_options = merge_options({}, options);
+        map_options.path = root;
+        map_options.limits ||= {};
+        map_options.limits.max_file_size ??= this.#options.limits.max_body_length;
+        if (map_options.limits.max_file_size > this.#options.limits.max_body_length)
+            throw new Error("The host's max_file_size exceeds the server's max_body_length.");
+        const map = new DirectoryMap(map_options);
+        const manager = new DirectoryManager(map, true);
+        map.on('error', (error) => this.emit('error', error));
+        map.on('log', (code, message) => this._log(code, `'${name}' - ${message}`));
+        map.on('file_size_limit', (uri, record) =>
+            this._log('SIZE_LIMIT_REACHED', `${uri} - SIZE_${record.stats.size}_BYTES`)
+        );
+        await map.ready();
+        map.on('mutation', (uri, entry) => this._publish_mutation(name, uri, entry, 'server'));
+        this.#hosts[name] = { path: root, map, manager };
+        return this.#hosts[name];
     }
 
     /**
-     * Returns the current active hosts for this instance.
-     * @returns {Object}
+     * Stops hosting a repository and closes its filesystem watcher.
+     *
+     * @param {string} name Repository name previously passed to host().
+     * @returns {Promise<boolean>} True when a repository was removed; false when it was unknown.
      */
-    get hosts() {
-        return this.#hosts;
+    async unhost(name) {
+        const hosted = this.#hosts[name];
+        if (!hosted) return false;
+        delete this.#hosts[name];
+        await hosted.map.destroy();
+        return true;
     }
 
     /**
-     * Returns the underlying HyperExpress webserver instance.
-     * @returns {HyperExpress.Server}
+     * Waits until HyperExpress has bound the listening socket.
+     *
+     * @returns {Promise<Server>} This server instance.
      */
-    get server() {
-        return this.#server;
+    ready() {
+        return this.#ready_promise;
     }
 
     /**
-     * Returns the constructor options for this instance.
+     * Gracefully closes HTTP, WebSocket, and filesystem resources. Idempotent.
+     *
+     * @returns {Promise<void>}
      */
-    get options() {
-        return this.#options;
+    destroy() {
+        if (this.#destroy_promise) return this.#destroy_promise;
+        this.#destroyed = true;
+        this.#destroy_promise = (async () => {
+            await this.#ready_promise.catch(() => undefined);
+            await this.#server.shutdown();
+            for (const websocket of this.#websockets) websocket.close(1001, 'Server shutting down');
+            this.#websockets.clear();
+            await Promise.all(Object.keys(this.#hosts).map((name) => this.unhost(name)));
+        })();
+        return this.#destroy_promise;
     }
+
+    /** @returns {Record<string, import('../../index.js').HostedDirectory>} Live repositories keyed by host name. */
+    get hosts() { return this.#hosts; }
+
+    /** @returns {HyperExpress.Server} Underlying HyperExpress v7 server. */
+    get server() { return this.#server; }
+
+    /** @returns {import('../../index.js').ServerOptions} Effective server options. */
+    get options() { return this.#options; }
+
+    /** @returns {boolean} Whether destroy() has started. */
+    get destroyed() { return this.#destroyed; }
 }

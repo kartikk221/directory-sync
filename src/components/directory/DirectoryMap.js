@@ -1,645 +1,706 @@
-import Path from 'path';
+import EventEmitter from 'node:events';
+import FileSystem from 'node:fs/promises';
+import OS from 'node:os';
+import Path from 'node:path';
 import Chokidar from 'chokidar';
-import EventEmitter from 'events';
-import FileSystem from 'fs';
+import StateStore from './StateStore.js';
+import { KeyedQueue, TaskQueue } from '../../utils/queues.js';
 import {
-    wrap_object,
-    match_extension,
-    to_path_uri,
-    to_forward_slashes,
+    RESERVED_DIRECTORY,
+    canonicalize_uri,
+    compare_entries,
+    entries_equivalent,
+    fingerprint_entry,
+    generate_sha256_hash,
     is_accessible_path,
-    generate_md5_hash,
+    match_extension,
+    merge_options,
+    resolve_uri,
+    to_forward_slashes,
+    to_path_uri,
+    validate_entry,
 } from '../../utils/operators.js';
 
-/**
- * @typedef {Object} FilteringObject
- * @property {Array<string>} files - The file names to filter (case sensitive). Examples: ['.env', 'secrets.json']
- * @property {Array<string>} directories - The directory names to filter (case sensitive). Examples: ['node_modules']
- * @property {Array<string>} extensions - The file/directory extensions to filter (case sensitive). Examples: `['.js', '.plugin.js', '.json']`.
- */
+const DEFAULT_OPTIONS = {
+    path: '',
+    filters: { keep: {}, ignore: {} },
+    watcher: {
+        alwaysStat: true,
+        usePolling: false,
+        awaitWriteFinish: { pollInterval: 100, stabilityThreshold: 500 },
+        followSymlinks: false,
+    },
+    limits: { max_file_size: 100 * 1024 * 1024 },
+    state: { path: '', max_tombstones: 10_000 },
+    hashing: { max_concurrent: Math.min(4, OS.availableParallelism?.() || OS.cpus().length || 1) },
+};
 
-/**
- * @typedef {function(String, FileSystem.Stats): Boolean} FilteringFunction
- */
+function normalize_filter(filter, name) {
+    if (filter == null) return {};
+    if (typeof filter === 'function') return filter; // v2 compatibility: evaluated by the owning process.
+    if (typeof filter !== 'object' || Array.isArray(filter))
+        throw new TypeError(`filters.${name} must be a function or a declarative filter object.`);
+    const output = {};
+    for (const key of ['files', 'directories', 'extensions']) {
+        if (filter[key] === undefined) continue;
+        if (!Array.isArray(filter[key]) || filter[key].some((value) => typeof value !== 'string'))
+            throw new TypeError(`filters.${name}.${key} must be an array of strings.`);
+        output[key] = [...filter[key]];
+    }
+    return output;
+}
 
-/**
- * @typedef {Object} DirectoryMapOptions
- * @property {String} path - The root path of the directory tree.
- * @property {Object} filters - The detection filters to apply to the directory tree.
- * @property {FilteringObject|FilteringFunction} filters.keep - Only files satisfying these filter(s) will be loaded into the Directory Tree.
- * @property {FilteringObject|FilteringFunction} filters.ignore - Files statisfying these filter(s) will NOT be loaded into the Directory Tree.
- * @property {Object} limits - The limit constants for this Directory Map.
- * @property {Number} limits.max_file_size - The maximum file size in bytes.
- * @property {Chokidar.WatchOptions} watcher - The watcher options to use when watching the directory tree.
- */
-
-/**
- * @typedef {Object} MapRecord
- * @property {String} path
- * @property {FileSystem.Stats} stats
- */
-
-export default class DirectoryMap extends EventEmitter {
-    #path;
-    #watcher;
-    #cleanup;
-    #files = {};
-    #directories = {};
-    #supressions = {};
-    #destroyed = false;
-    #options = {
-        path: '',
-        filters: {
-            keep: {},
-            ignore: {},
-        },
-        watcher: {
-            alwaysStat: true,
-            usePolling: false,
-            awaitWriteFinish: {
-                pollInterval: 100,
-                stabilityThreshold: 500,
-            },
-        },
-        limits: {
-            max_file_size: 1024 * 1024 * 100,
-        },
+function compile_filter(filter) {
+    if (typeof filter === 'function') return filter;
+    const files = (filter.files || []).map(to_path_uri);
+    const directories = (filter.directories || []).map(to_path_uri);
+    const extensions = filter.extensions || [];
+    if (!files.length && !directories.length && !extensions.length) return undefined;
+    return (uri, stats, strict = true) => {
+        const is_directory = stats.isDirectory();
+        const in_directory = directories.some(
+            (candidate) => uri === candidate || uri.startsWith(`${candidate}/`) || uri.endsWith(candidate)
+        );
+        if (in_directory) return true;
+        if (is_directory) {
+            if (strict) return false;
+            return (
+                Boolean(extensions.length) ||
+                directories.some((candidate) => candidate.startsWith(`${uri}/`)) ||
+                files.some((candidate) => candidate.startsWith(`${uri}/`))
+            );
+        }
+        if (files.some((candidate) => uri === candidate || uri.endsWith(candidate))) return true;
+        const name = Path.posix.basename(uri);
+        if (extensions.some((extension) => match_extension(name, extension))) return true;
+        return strict ? false : !files.length && !extensions.length;
     };
+}
+
+function stats_adapter(type) {
+    return {
+        isDirectory: () => type === 'directory',
+        isFile: () => type === 'file',
+        isSymbolicLink: () => false,
+    };
+}
+
+/**
+ * Tracks a synchronized root, its content hashes, and durable deletion history.
+ *
+ * Chokidar reports that a path may have changed; it does not provide a serialized
+ * transaction log. DirectoryMap therefore revalidates filesystem state, serializes
+ * work by canonical URI, and records only stable entries in memory and StateStore.
+ *
+ * @extends EventEmitter
+ */
+export default class DirectoryMap extends EventEmitter {
+    #destroyed = false;
+    #directories = {};
+    #expected = new Map();
+    #files = {};
+    #hash_queue;
+    #ignore_filter;
+    #initializing = true;
+    #keep_filter;
+    #legacy_supressions = Object.create(null);
+    #options;
+    #path;
+    #pending = new Set();
+    #ready_promise;
+    #recent_directory_deletions = new Map();
+    #serial = new KeyedQueue();
+    #state;
+    #watcher;
 
     /**
-     * Initializes a new DirectoryMap instance.
-     * @param {DirectoryMapOptions} options
+     * Creates a live map for a local directory.
+     *
+     * @param {import('../../../index.js').DirectoryMapOptions} options Mapping, filtering, watcher, and state options.
      */
     constructor(options) {
-        // Ensure options is valid object
-        if (options === null || typeof options !== 'object')
-            throw new Error('new DirectoryMap(options) -> options is not an object.');
-
-        // Ensure we received a valid options.path
-        if (typeof options.path !== 'string')
-            throw new Error('new DirectoryMap(options.path) -> path must be a String.');
-
-        // Initialize the EventEmitter class
         super();
+        if (!options || typeof options !== 'object')
+            throw new TypeError('new DirectoryMap(options) -> options must be an object.');
+        if (typeof options.path !== 'string' || !options.path)
+            throw new TypeError('new DirectoryMap(options.path) -> path must be a non-empty string.');
+        if (options.watcher?.followSymlinks === true)
+            throw new TypeError('DirectorySync v3 does not follow symbolic links; watcher.followSymlinks must be false.');
 
-        // Store the provided options locally for future access
-        options.path = to_forward_slashes(Path.resolve(options.path));
-        wrap_object(this.#options, options);
-        this.#path = options.path;
-        delete this.#options.path;
-
-        // Parse the "keep" and "ignore" filter functions into usable functions
-        const reference = this;
-        const { keep, ignore } = this.#options.filters;
-        [keep, ignore].forEach((filter, index) => {
-            // Index 0 is "keep" and index 1 is "ignore"
-            // We store the parsed filter functions with "_" prefix to sginify that they are not user-provided
-            const FILTER_TYPE = index === 0 ? '_keep' : '_ignore';
-            if (typeof filter == 'function') {
-                // If the filter is a function, use it as is
-                reference.#options.filters[FILTER_TYPE] = filter;
-            } else if (filter && typeof filter == 'object') {
-                // Destructure the names and extensions from the filter
-                const { files, directories, extensions } = filter;
-                const has_files = Array.isArray(files) && files.length > 0;
-                const has_directories = Array.isArray(directories) && directories.length > 0;
-                const has_extensions = Array.isArray(extensions) && extensions.length > 0;
-
-                // Convert files, directories, and extensions to uris
-                const file_uris = has_files ? files.map((file) => to_path_uri(file)) : [];
-                const directory_uris = has_directories ? directories.map((directory) => to_path_uri(directory)) : [];
-
-                // If the filter has names or extensions, use a function to filter the DirectoryMap
-                if (has_files || has_directories || has_extensions)
-                    reference.#options.filters[FILTER_TYPE] = (path, stats, strict) => {
-                        // Perform strict matching based on the matchable candidates provided by the filter
-                        const is_directory = stats.isDirectory();
-                        if (is_directory) {
-                            // We can only perform strict matching on a directory if we have some directory candidates to match against
-                            if (has_directories) {
-                                // Match one of the directory candidate uris as the ending of the provided path
-                                // This essentially checks if the provided path is of one of the directory candidates
-                                if (directory_uris.find((uri) => path.endsWith(uri))) return true;
-
-                                // If we are in non-strict mode, we can perform loose matching with the directory candidates as the parents of the provided path
-                                // This essentially checks if the current path directory is a child in the hierarchy of one of the directory candidates
-                                if (!strict) {
-                                    // Match each directory URI individually as a parent of the provided path
-                                    for (const uri of directory_uris) {
-                                        // URIs don't have trailing slashes so we need to add one to the end of the uri to make this a parent path check
-                                        const [_, right] = path.split(`${uri}/`);
-
-                                        // If we have some content on the right side of the split, then this is a child of the directory candidate
-                                        if (right) return true;
-                                    }
-                                }
-                            }
-                        } else {
-                            // Match one of the file candidate uris as the ending of the provided path
-                            // This essentially checks if the provided path is of one of the file candidates
-                            if (has_files && file_uris.find((uri) => path.endsWith(uri))) return true;
-
-                            // Match one of the extension candidate uris as the ending of the provided path
-                            // This essentially checks if the file at provided path is of one of the extension candidates
-                            if (has_extensions) {
-                                const name = path.split('/').slice(-1)[0];
-                                if (extensions.find((extension) => match_extension(name, extension))) return true;
-                            }
-                        }
-
-                        // Match one of the directory candidates as parent paths of the provided path
-                        // This essentially prevents sub-directories and sub-files of a directory candidate from not being matched
-                        if (has_directories) {
-                            // Match each directory URI individually as a parent of the provided path
-                            for (const uri of directory_uris) {
-                                // URIs don't have trailing slashes so we need to add one to the end of the uri to make this a parent path check
-                                const [_, right] = path.split(`${uri}/`);
-
-                                // If we have some content on the right side of the split, then this is a child of the directory candidate
-                                if (right) return true;
-                            }
-                        }
-
-                        // At this point, none of the targeting filters from before matched this resource
-                        // Let's attempt to do loose matching if strict matching is not required
-                        if (strict) {
-                            // Since strict matching is required, we can return false immediately without performing any loose matching
-                            return false;
-                        } else {
-                            // Perform loose matching based on the matchable candidates provided by the filter
-                            if (is_directory) {
-                                // If this is a directory and the filter has not matchable directory candidates than this filter loosely matches everything
-                                // Hence we can return a true match if the filter has no directory candidates to match against
-                                return !has_directories;
-                            } else {
-                                // If this is a file and the filter has no matchable file or extension candidates than this filter loosely matches everything
-                                // Hence we can return a true match if the filter has no file or extension candidates to match against
-                                return !has_files && !has_extensions;
-                            }
-                        }
-                    };
-            }
-        });
-
-        // Initialize the chokidar watcher instance
-        this._initialize_watcher().catch((error) => this.emit('error', error));
-
-        // Initialize the cleanup interval to cleanup supressions
-        this.#cleanup = setInterval(() => this._cleanup_supressions(), 1000 * 60);
+        this.#options = merge_options(DEFAULT_OPTIONS, options);
+        this.#options.filters.keep = normalize_filter(this.#options.filters.keep, 'keep');
+        this.#options.filters.ignore = normalize_filter(this.#options.filters.ignore, 'ignore');
+        this.#path = to_forward_slashes(Path.resolve(this.#options.path));
+        this.#options.path = this.#path;
+        this.#options.watcher.alwaysStat = true;
+        // Match Chokidar's documented backend behavior: atomic coalescing is
+        // useful with fs.watch, while polling already supplies stable snapshots.
+        if (options.watcher?.atomic === undefined)
+            this.#options.watcher.atomic = !this.#options.watcher.usePolling;
+        this.#options.watcher.followSymlinks = false;
+        this.#options.state.path = this.#options.state.path
+            ? Path.resolve(this.#options.state.path)
+            : Path.join(this.#path, RESERVED_DIRECTORY);
+        const concurrency = this.#options.hashing.max_concurrent;
+        if (!Number.isSafeInteger(concurrency) || concurrency < 1)
+            throw new TypeError('hashing.max_concurrent must be a positive safe integer.');
+        this.#hash_queue = new TaskQueue(concurrency);
+        this.#state = new StateStore(this.#path, this.#options.state, (code, message) =>
+            this.emit('log', code, message)
+        );
+        this.#ready_promise = this._initialize();
+        this.#ready_promise.catch((error) => this.emit('error', error));
     }
 
-    /**
-     * Destroys this DirectoryMap instance.
-     *
-     * @returns {Promise}
-     */
-    destroy() {
-        this.#destroyed = true;
-        clearInterval(this.#cleanup);
-        return this.#watcher.close();
-    }
+    async _initialize() {
+        if (!(await is_accessible_path(this.#path, { directory: true })))
+            throw new Error(`Unable to access synchronized directory: ${this.#path}`);
+        await this.#state.initialize();
+        const previous = new Map(this.#state.active);
 
-    #ready_resolve;
-    #ready_promise = new Promise((resolve) => (this.#ready_resolve = resolve));
-
-    /**
-     * Returns a Promise which is resolved once this DirecotryTree instance is ready to be used.
-     * @returns {Promise<void>}
-     */
-    ready() {
-        return this.#ready_promise;
-    }
-
-    /**
-     * Returns the associated map record for the specified uri if it exists.
-     *
-     * @param {String} uri
-     * @returns {MapRecord=}
-     */
-    get(uri) {
-        return this.#directories[uri] || this.#files[uri];
-    }
-
-    /**
-     * Cleans up expired supressions from the supressions map.
-     * @private
-     * @param {number} max_age_ms
-     */
-    _cleanup_supressions(max_age_ms = 1000) {
-        // Cleanup any supressions that are older than the max age
-        const now = Date.now();
-        for (const key in this.#supressions) {
-            const { updated_at } = this.#supressions[key];
-            if (now - updated_at > max_age_ms) delete this.#supressions[key];
-        }
-    }
-
-    /**
-     * Supresses a future event from being emitted on a uri.
-     *
-     * @param {String} uri
-     * @param {String} event
-     * @param {Number} amount
-     * @returns {Number} The amount of supressions for this uri/event.
-     */
-    supress(uri, event, amount = 1) {
-        // Ignore temporary uris
-        if (uri.startsWith('temporary://')) return;
-
-        // Initialize the supression key or increment the amount of supressions
-        const key = `${event}:${uri}`;
-        if (!this.#supressions[key]) {
-            this.#supressions[key] = {
-                amount,
-                updated_at: Date.now(),
-            };
-        } else {
-            this.#supressions[key].amount += amount;
-            this.#supressions[key].updated_at = Date.now();
-        }
-        return this.#supressions[key];
-    }
-
-    /**
-     * Depresses a supressed event from being emitted on a uri.
-     *
-     * @private
-     * @param {String} uri
-     * @param {String} event
-     * @param {Number} amount
-     * @returns {Boolean} Whether the event was successfully de-pressed
-     */
-    _depress(uri, event, amount = 1) {
-        // Decrement the amount of supressions and delete if it is less than 1
-        const key = `${event}:${uri}`;
-        if (this.#supressions[key]) {
-            this.#supressions[key].amount -= amount;
-            if (this.#supressions[key].amount < 1) delete this.#supressions[key];
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * Initializes the underlying watcher instance that will power this directory tree.
-     * @private
-     */
-    async _initialize_watcher() {
-        // Retrieve the root path from user options
-        const path = this.#path;
-        const { watcher } = this.#options;
-
-        // Ensure the provided root path is accessible
-        if (!(await is_accessible_path(path)))
-            throw new Error(`new DirectoryMap(options.path) -> Unable to access the provided path: ${path}`);
-
-        // Inject the top level filter callback into the watcher options
-        const reference = this;
-        const { _keep, _ignore } = this.#options.filters;
-        watcher.ignored = (path, stats) => {
-            // If this execution does not have stats avaialble then we cannot filter it hence we allow it
-            if (stats === undefined) return false;
-
-            // Always ignore the root path from being filtered
-            if (path === reference.#path) return false;
-
-            // Extrapolate the relative path for filtering this file/directory
-            const relative = reference._relative_uri(path);
-
-            // Assert the "ignore" filter as strict if one is available
-            // The "ignore" filter is applied first as it is more restrictive and takes precedence over the "keep" filter
-            if (typeof _ignore == 'function' && _ignore(relative, stats, true)) return true;
-
-            // Assert the "keep" filter and return true to filter this file/directory if it fails
-            if (typeof _keep == 'function' && !_keep(relative, stats, false)) return true;
-
-            // If this candidate passes above filters, then it is good to be tracked
-            return false;
+        this.#keep_filter = compile_filter(this.#options.filters.keep);
+        this.#ignore_filter = compile_filter(this.#options.filters.ignore);
+        const user_ignored = this.#options.watcher.ignored;
+        const state_path = to_forward_slashes(this.#state.path);
+        this.#options.watcher.ignored = (path, stats) => {
+            const absolute = to_forward_slashes(Path.resolve(path));
+            if (absolute === state_path || absolute.startsWith(`${state_path}/`)) return true;
+            if (stats?.isSymbolicLink?.()) return true;
+            if (absolute === this.#path) return false;
+            if (typeof user_ignored === 'function' && user_ignored(path, stats)) return true;
+            if (!stats) return false;
+            const uri = this.relative_uri(absolute);
+            if (this.#ignore_filter?.(uri, stats, true)) return true;
+            return Boolean(this.#keep_filter && !this.#keep_filter(uri, stats, false));
         };
 
-        // Initialize the chokidar watcher instance for this root path
-        this.#watcher = Chokidar.watch(path, watcher);
-
-        // Bind appropriate handlers to consume the watcher events
-        this.#watcher.on('addDir', (path, stats) => this._on_directory_create(path, stats));
-        this.#watcher.on('unlinkDir', (path) => this._on_directory_delete(path));
-        this.#watcher.on('unlink', (path) => this._on_file_delete(path));
-
-        // The ready event should wait for all asynchronous operations to complete
-        const promises = [];
-        this.#watcher.on('add', (path, stats) => {
-            const promise = this._on_file_add(path, stats, stats.size > 0);
-            if (reference.#ready_resolve) promises.push(promise);
+        this.#watcher = Chokidar.watch(this.#path, this.#options.watcher);
+        this.#watcher.on('error', (error) => this.emit('error', error));
+        this.#watcher.on('addDir', (path, stats) => this._track(this._on_directory(path, stats, false)));
+        this.#watcher.on('add', (path, stats) => this._track(this._on_file(path, stats, false)));
+        this.#watcher.on('change', (path, stats) => this._track(this._on_file(path, stats, true)));
+        this.#watcher.on('unlink', (path) => this._track(this._on_delete(path, 'file')));
+        this.#watcher.on('unlinkDir', (path) => this._track(this._on_delete(path, 'directory')));
+        await new Promise((resolve, reject) => {
+            this.#watcher.once('ready', resolve);
+            this.#watcher.once('error', reject);
         });
+        while (this.#pending.size) await Promise.allSettled([...this.#pending]);
 
-        this.#watcher.on('change', (path, stats) => {
-            const promise = this._on_file_change(path, stats);
-            if (reference.#ready_resolve) promises.push(promise);
+        // Active entries from the last snapshot that are absent from the initial
+        // scan were deleted while this process was offline. Convert only the
+        // shallowest missing directories to tombstones to avoid ledger waste.
+        const current = [];
+        for (const records of [this.#directories, this.#files])
+            for (const [uri, record] of Object.entries(records)) current.push([uri, record.entry]);
+        const current_uris = new Set(current.map(([uri]) => uri));
+        const missing_directories = [];
+        const deleted_at = Date.now();
+        const missing = [...previous]
+            .filter(([uri]) => !current_uris.has(uri))
+            .sort(([left], [right]) => left.split('/').length - right.split('/').length);
+        for (const [uri, entry] of missing) {
+            if (missing_directories.some((parent) => uri.startsWith(`${parent}/`))) continue;
+            const target = entry.type === 'directory' ? 'directory' : 'file';
+            const timestamp = Math.max(deleted_at, Math.min(Number.MAX_SAFE_INTEGER, entry.modified_at + 1));
+            await this.#state.record_tombstone(uri, {
+                type: 'tombstone',
+                target,
+                deleted_at: timestamp,
+                include_self: true,
+            });
+            if (target === 'directory') missing_directories.push(uri);
+        }
+        this.#state.replace_active(current);
+        this.#initializing = false;
+    }
+
+    _track(promise) {
+        this.#pending.add(promise);
+        promise.catch((error) => this.emit('error', error)).finally(() => this.#pending.delete(promise));
+    }
+
+    /**
+     * Converts an absolute path under this map into its canonical wire URI.
+     *
+     * @param {string} path Absolute or root-relative filesystem path.
+     * @returns {string} Canonical forward-slash URI.
+     */
+    relative_uri(path) {
+        const relative = to_forward_slashes(Path.relative(this.#path, Path.resolve(path)));
+        return canonicalize_uri(`/${relative}`);
+    }
+
+    /**
+     * Resolves a canonical URI without allowing it to escape the synchronized root.
+     *
+     * @param {string} uri Repository URI.
+     * @returns {string} Absolute filesystem path.
+     */
+    resolve(uri) {
+        return resolve_uri(this.#path, uri);
+    }
+
+    /**
+     * Tests whether the configured keep/ignore filters permit an entry.
+     *
+     * @param {string} uri Repository URI.
+     * @param {'file'|'directory'} [type='file'] Candidate entry type.
+     * @returns {boolean}
+     */
+    allows(uri, type = 'file') {
+        const canonical = canonicalize_uri(uri);
+        const stats = stats_adapter(type);
+        return (
+            !this.#ignore_filter?.(canonical, stats, true) &&
+            (!this.#keep_filter || this.#keep_filter(canonical, stats, false))
+        );
+    }
+
+    async _stable_file_entry(path, stats) {
+        // Hashing is optimistic: reuse a hash only when size and mtime match the
+        // persistent cache, otherwise verify that both remained stable around the
+        // streamed SHA-256 pass. A type transition is retried by its own event.
+        let before = stats;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (!before || !before.isFile()) before = await FileSystem.lstat(path);
+            if (before.isSymbolicLink() || !before.isFile()) return undefined;
+            const modified_at = Math.round(before.mtimeMs);
+            const cached = this.#state.get_cached(this.relative_uri(path));
+            let sha256;
+            if (
+                cached?.type === 'file' &&
+                cached.size === before.size &&
+                cached.modified_at === modified_at
+            ) sha256 = cached.sha256;
+            else {
+                try {
+                    sha256 = await this.#hash_queue.run(() => generate_sha256_hash(path));
+                } catch (error) {
+                    if (['EISDIR', 'ENOENT'].includes(error.code)) return undefined;
+                    throw error;
+                }
+            }
+            const after = await FileSystem.lstat(path);
+            if (after.size === before.size && Math.round(after.mtimeMs) === modified_at)
+                return { type: 'file', modified_at, size: after.size, sha256 };
+            before = after;
+        }
+        throw new Error(`File changed repeatedly while hashing: ${path}`);
+    }
+
+    _record(uri, path, stats, entry) {
+        return {
+            uri,
+            path: to_forward_slashes(path),
+            entry,
+            stats: {
+                md5: entry.type === 'file' ? entry.sha256 : '',
+                sha256: entry.type === 'file' ? entry.sha256 : '',
+                size: entry.type === 'file' ? entry.size : stats?.size || 0,
+                created_at: Math.round(stats?.birthtimeMs ?? entry.modified_at),
+                modified_at: entry.modified_at,
+            },
+        };
+    }
+
+    _consume_expected(uri, entry) {
+        // Filesystem mutations performed by DirectoryManager also generate
+        // Chokidar events. Fingerprints suppress only the exact expected echo;
+        // unrelated user changes are never hidden by a counter.
+        const expected = this.#expected.get(uri);
+        if (!expected) return false;
+        this.#expected.delete(uri);
+        return expected.expires_at >= Date.now() && expected.fingerprint === fingerprint_entry(entry);
+    }
+
+    async _on_directory(path, stats, changed) {
+        if (to_forward_slashes(Path.resolve(path)) === this.#path || this.#destroyed) return;
+        const uri = this.relative_uri(path);
+        await this.#serial.run(uri, async () => {
+            stats ||= await FileSystem.lstat(path);
+            if (stats.isSymbolicLink() || !stats.isDirectory() || !this.allows(uri, 'directory')) return;
+            const entry = { type: 'directory', modified_at: Math.round(stats.mtimeMs) };
+            const previous = this.get_entry(uri);
+            this.commit_entry(uri, entry, stats);
+            if (this.#initializing || this._consume_expected(uri, entry) || entries_equivalent(previous, entry)) return;
+            const record = this.get(uri);
+            if (this._depress(uri, 'directory_create')) return;
+            this.emit('directory_create', uri, record);
+            this.emit('mutation', uri, entry, previous);
         });
+    }
 
-        // Wait for all pending promises to resolve before resolving the ready promise
-        this.#watcher.on('ready', async () => {
-            if (promises.length > 0) await Promise.all(promises);
-            reference.#ready_resolve();
-            reference.#ready_resolve = null;
+    async _on_file(path, stats, changed) {
+        if (this.#destroyed) return;
+        stats ||= await FileSystem.lstat(path);
+        if (stats.isDirectory()) return this._on_directory(path, stats, true);
+        const uri = this.relative_uri(path);
+        await this.#serial.run(uri, async () => {
+            if (!this.allows(uri, 'file')) return;
+            const entry = await this._stable_file_entry(path, stats);
+            if (!entry) return;
+            const previous = this.get_entry(uri);
+            const record = this._record(uri, path, stats, entry);
+            if (this.#options.limits.max_file_size && entry.size > this.#options.limits.max_file_size) {
+                delete this.#files[uri];
+                this.#state.remove_active(uri);
+                this.emit('file_size_limit', uri, record);
+                return;
+            }
+            this.commit_entry(uri, entry, stats);
+            this.emit(`md5_change:${uri}`, this.get(uri));
+            if (this.#initializing || this._consume_expected(uri, entry) || entries_equivalent(previous, entry)) return;
+            const event = previous?.type === 'file' || changed ? 'file_change' : 'file_create';
+            if (this._depress(uri, event)) return;
+            this.emit(event, uri, this.get(uri));
+            this.emit('mutation', uri, entry, previous);
         });
+    }
 
-        // Bind a global close handler to close the chokidar instance
-        // This will prevent the watcher from hanging on to the process
-        ['exit', 'SIGINT', 'SIGUSR1', 'SIGUSR2', 'SIGTERM', 'uncaughtException'].forEach((type) =>
-            process.once(type, () => reference.#watcher.close())
+    _covered_deletion_time(uri) {
+        const now = Date.now();
+        for (const [parent, value] of this.#recent_directory_deletions) {
+            if (now - value > 1_000) this.#recent_directory_deletions.delete(parent);
+            else if (uri.startsWith(`${parent}/`)) return value;
+        }
+        return now;
+    }
+
+    async _on_delete(path, target) {
+        if (this.#destroyed) return;
+        const uri = this.relative_uri(path);
+        await this.#serial.run(uri, async () => {
+            // Chokidar's atomic option intentionally delays unlink by 100 ms and
+            // polling observes at its own interval. A queued unlink may therefore
+            // arrive after recreation. Events are notifications, so disk is the
+            // final truth: re-arm an existing path and never mint a false tombstone.
+            try {
+                await FileSystem.lstat(path);
+                if (!this.#destroyed) this.#watcher.unwatch(path).add(path);
+                return;
+            } catch (error) {
+                if (error.code !== 'ENOENT') throw error;
+            }
+            const previous = this.get_entry(uri);
+            if (!previous) return;
+            let stale_type = false;
+            if (previous.type !== target) {
+                target = previous.type;
+                stale_type = true;
+            }
+            const expected = this._expected_tombstone(uri, target);
+            const base = expected?.entry.deleted_at ??
+                (target === 'directory' ? Date.now() : this._covered_deletion_time(uri));
+            const deleted_at = Math.max(
+                base,
+                Math.min(Number.MAX_SAFE_INTEGER, previous.modified_at + 1)
+            );
+            if (target === 'directory') this.#recent_directory_deletions.set(uri, deleted_at);
+            const entry = { type: 'tombstone', target, deleted_at, include_self: true };
+            const applied = await this.commit_tombstone(uri, entry);
+            if (stale_type && !this.#destroyed) this.#watcher.unwatch(path).add(path);
+            if (expected?.uri === uri) this.#expected.delete(uri);
+            if (this.#initializing || expected) return;
+            const event = target === 'directory' ? 'directory_delete' : 'file_delete';
+            if (this._depress(uri, event)) return;
+            this.emit(event, uri);
+            this.emit('mutation', uri, applied, previous);
+        });
+    }
+
+    _expected_tombstone(uri, target) {
+        const now = Date.now();
+        let cursor = uri;
+        while (cursor && cursor !== '/') {
+            const expected = this.#expected.get(cursor);
+            if (expected?.expires_at < now) this.#expected.delete(cursor);
+            else if (
+                expected?.entry.type === 'tombstone' &&
+                (cursor === uri ? expected.entry.target === target : expected.entry.target === 'directory')
+            ) return { uri: cursor, entry: expected.entry };
+            const parent = Path.posix.dirname(cursor);
+            cursor = parent === cursor ? '/' : parent;
+        }
+        return undefined;
+    }
+
+    /**
+     * Registers the exact watcher event expected from an internal disk mutation.
+     *
+     * @param {string} uri Repository URI.
+     * @param {import('../../../index.js').Entry} entry Expected canonical entry.
+     * @param {number} [ttl=5000] Maximum suppression lifetime in milliseconds.
+     * @returns {void}
+     */
+    expect(uri, entry, ttl = 5_000) {
+        const canonical = canonicalize_uri(uri);
+        validate_entry(entry);
+        this.#expected.set(canonical, {
+            entry,
+            fingerprint: fingerprint_entry(entry),
+            expires_at: Date.now() + ttl,
+        });
+    }
+
+    /**
+     * Backward-compatible misspelled event suppression method retained from v2.
+     * Internal v3 writes use expect() fingerprints, while explicit callers keep
+     * the original event/count behavior and return shape.
+     *
+     * @param {string} uri Repository URI.
+     * @param {string} [event] V2 event name to suppress.
+     * @param {number} [amount=1] Number of matching events to suppress.
+     * @returns {{amount: number, updated_at: number}|undefined} Legacy suppression record.
+     */
+    supress(uri, event, amount = 1) {
+        if (typeof event === 'string') {
+            if (uri.startsWith('temporary://')) return undefined;
+            const canonical = canonicalize_uri(uri);
+            const key = `${event}:${canonical}`;
+            const existing = this.#legacy_supressions[key];
+            if (existing) {
+                existing.amount += amount;
+                existing.updated_at = Date.now();
+            } else this.#legacy_supressions[key] = { amount, updated_at: Date.now() };
+            return this.#legacy_supressions[key];
+        }
+        const entry = this.get_entry(uri);
+        if (entry) this.expect(uri, entry);
+        return undefined;
+    }
+
+    /**
+     * Removes a watcher expectation. Retained for v2 code that called the legacy helper.
+     *
+     * @param {string} uri Repository URI.
+     * @param {string} [event] Ignored legacy event name.
+     * @param {number} [amount=1] Ignored legacy count.
+     * @returns {boolean}
+     */
+    _depress(uri, event, amount = 1) {
+        if (typeof event !== 'string') return this.#expected.delete(uri);
+        const key = `${event}:${canonicalize_uri(uri)}`;
+        const suppression = this.#legacy_supressions[key];
+        if (!suppression) return false;
+        suppression.amount -= amount;
+        if (suppression.amount < 1) delete this.#legacy_supressions[key];
+        return true;
+    }
+
+    /** @param {number} [max_age_ms=1000] Maximum legacy suppression age. @returns {void} */
+    _cleanup_supressions(max_age_ms = 1_000) {
+        const now = Date.now();
+        for (const [uri, value] of this.#expected) if (value.expires_at < now) this.#expected.delete(uri);
+        for (const [key, value] of Object.entries(this.#legacy_supressions))
+            if (now - value.updated_at > max_age_ms) delete this.#legacy_supressions[key];
+    }
+
+    /**
+     * Commits already-validated active metadata to the in-memory and durable maps.
+     * This method does not mutate the filesystem.
+     *
+     * @param {string} uri Repository URI.
+     * @param {import('../../../index.js').FileEntry|import('../../../index.js').DirectoryEntry} entry Active entry.
+     * @param {import('node:fs').Stats} [stats] Current filesystem stats.
+     * @returns {import('../../../index.js').MapRecord}
+     */
+    commit_entry(uri, entry, stats) {
+        const canonical = canonicalize_uri(uri);
+        validate_entry(entry);
+        if (entry.type === 'tombstone') throw new TypeError('commit_entry requires an active entry.');
+        const path = this.resolve(canonical);
+        const record = this._record(canonical, path, stats, entry);
+        if (entry.type === 'file') {
+            delete this.#directories[canonical];
+            this.#files[canonical] = record;
+        } else {
+            delete this.#files[canonical];
+            this.#directories[canonical] = record;
+        }
+        this.#state.set_active(canonical, entry);
+        return record;
+    }
+
+    /**
+     * Commits a deletion and removes only active entries not newer than it.
+     * Directory tombstones become non-self tombstones when a newer descendant
+     * must keep the containing directory alive.
+     *
+     * @param {string} uri Repository URI.
+     * @param {import('../../../index.js').TombstoneEntry} entry Deletion record.
+     * @returns {Promise<import('../../../index.js').TombstoneEntry>}
+     */
+    async commit_tombstone(uri, entry) {
+        const canonical = canonicalize_uri(uri);
+        validate_entry(entry);
+        if (entry.type !== 'tombstone') throw new TypeError('commit_tombstone requires a tombstone.');
+        if (entry.target === 'directory') {
+            let protected_descendant = false;
+            for (const records of [this.#files, this.#directories]) {
+                for (const candidate of Object.keys(records)) {
+                    if (candidate !== canonical && !candidate.startsWith(`${canonical}/`)) continue;
+                    if (candidate === canonical && entry.include_self === false) continue;
+                    if (compare_entries(records[candidate].entry, entry) < 0) {
+                        protected_descendant ||= candidate !== canonical;
+                        continue;
+                    }
+                    delete records[candidate];
+                    this.#state.remove_active(candidate);
+                }
+            }
+            if (protected_descendant) entry = { ...entry, include_self: false };
+        } else {
+            delete this.#files[canonical];
+            delete this.#directories[canonical];
+            this.#state.remove_active(canonical);
+        }
+        return this.#state.record_tombstone(canonical, entry);
+    }
+
+    /**
+     * Returns active entries at or below a URI for directory-deletion planning.
+     *
+     * @param {string} uri Repository URI.
+     * @returns {Record<string, import('../../../index.js').FileEntry|import('../../../index.js').DirectoryEntry>}
+     */
+    active_entries_under(uri) {
+        const canonical = canonicalize_uri(uri);
+        const output = {};
+        for (const records of [this.#directories, this.#files])
+            for (const [candidate, record] of Object.entries(records))
+                if (candidate === canonical || candidate.startsWith(`${canonical}/`))
+                    output[candidate] = record.entry;
+        return output;
+    }
+
+    /**
+     * Runs a mutation after earlier mutations for the same URI.
+     *
+     * @template T
+     * @param {string} uri Repository URI used as the serialization key.
+     * @param {() => T|Promise<T>} handler Work to perform.
+     * @returns {Promise<T>}
+     */
+    run_serial(uri, handler) {
+        return this.#serial.run(canonicalize_uri(uri), handler);
+    }
+
+    /** @param {string} uri Repository URI. @returns {import('../../../index.js').MapRecord|undefined} Active map record. */
+    get(uri) {
+        const canonical = canonicalize_uri(uri);
+        return this.#directories[canonical] || this.#files[canonical];
+    }
+
+    /** @param {string} uri Repository URI. @returns {import('../../../index.js').FileEntry|import('../../../index.js').DirectoryEntry|undefined} Active entry metadata. */
+    get_entry(uri) {
+        return this.get(uri)?.entry;
+    }
+
+    /** @param {string} uri Repository URI. @returns {import('../../../index.js').TombstoneEntry|undefined} Exact tombstone. */
+    get_tombstone(uri) {
+        return this.#state.get_tombstone(canonicalize_uri(uri));
+    }
+
+    /**
+     * Returns the newest effective active entry or covering tombstone for a URI.
+     *
+     * @param {string} uri Repository URI.
+     * @returns {import('../../../index.js').Entry|undefined}
+     */
+    canonical_entry(uri) {
+        const active = this.get_entry(uri);
+        const tombstone = this.#state.effective_tombstone(uri);
+        return compare_entries(active, tombstone) === 1 ? tombstone : active || tombstone;
+    }
+
+    /** @returns {Record<string, import('../../../index.js').Entry>} Sorted protocol-v3 manifest. */
+    get manifest() {
+        const output = {};
+        for (const records of [this.#directories, this.#files])
+            for (const [uri, record] of Object.entries(records)) output[uri] = record.entry;
+        for (const [uri, tombstone] of this.#state.tombstones) {
+            if (
+                (tombstone.target === 'directory' && tombstone.include_self === false) ||
+                compare_entries(output[uri], tombstone) === 1
+            ) output[uri] = tombstone;
+        }
+        return Object.fromEntries(
+            Object.entries(output).sort(([left], [right]) => {
+                const depth = left.split('/').length - right.split('/').length;
+                return depth || left.localeCompare(right);
+            })
         );
     }
 
     /**
-     * Returns the relative path to the root of the directory tree.
+     * V2-shaped metadata getter retained for applications that inspect it.
+     * File hashes are SHA-256 in v3 even though the legacy slot previously held MD5.
      *
-     * @private
-     * @param {String} path
-     * @returns {String}
-     */
-    _relative_uri(path) {
-        // Retrieve the relative path by removing the root path from the provided path
-        return to_forward_slashes(path).replace(this.#path, '');
-    }
-
-    /**
-     * @typedef {Object} FilteredStats
-     * @property {Number} size - The size of the file in bytes.
-     * @property {Number} created_at - The time the file was created in milliseconds since epoch.
-     * @property {Number} modified_at - The time the file was last modified in milliseconds since epoch.
-     */
-
-    /**
-     * Returns a filtered object with only important FileSystem.stats properties.
-     *
-     * @private
-     * @param {FileSystem.Stats} stats
-     * @returns {FilteredStats}
-     */
-    _filtered_stats(stats) {
-        return {
-            md5: stats.md5 || '',
-            size: stats.size,
-            created_at: Math.round(stats.birthtimeMs),
-            modified_at: Math.round(stats.mtimeMs),
-        };
-    }
-
-    /**
-     * @typedef {Object} ObjectStats
-     * @property {String} uri - The relative path/uri of the object file/directory.
-     * @property {String} path - The absolute path to the object file/directory.
-     * @property {FilteredStats} stats - The filtered stats of the object file/directory.
-     */
-
-    /**
-     * Returns a formed object state for the provided file/directory path.
-     *
-     * @private
-     * @param {String} path
-     * @param {FileSystem.Stats} stats
-     * @returns {ObjectStats}
-     */
-    _object_stats(path, stats) {
-        // Retrieve the relative path to the directory
-        const relative_uri = this._relative_uri(path);
-
-        // Ignore the root directory from being stored in directories map
-        if (relative_uri.length == 0) return;
-
-        // Return the formated object stats
-        return {
-            uri: relative_uri,
-            path: to_forward_slashes(path),
-            stats: this._filtered_stats(stats),
-        };
-    }
-
-    /**
-     * Asserts whether the provided path and stats are ignored by the watcher.
-     *
-     * @param {String} path
-     * @param {FileSystem.Stats=} stats
-     * @returns {boolean}
-     */
-    _is_watcher_ignored(path, stats) {
-        return this.#options.watcher.ignored(path, stats);
-    }
-
-    /**
-     * Handles the watcher directory create event.
-     *
-     * @private
-     * @param {String} path
-     * @param {FileSystem.Stats} stats
-     */
-    _on_directory_create(path, stats) {
-        // Assert the watcher ignored on this directory
-        if (this._is_watcher_ignored(path, stats)) return;
-
-        // Retrieve the relative path to the directory
-        const object = this._object_stats(path, stats);
-        if (object) {
-            // Expire schema & store the object by the relative path aka uri
-            this.#schema = null;
-            this.#directories[object.uri] = object;
-
-            // Emit the directory create event if it is not supressed
-            if (!this._depress(object.uri, 'directory_create', 1)) this.emit('directory_create', object.uri, object);
-        }
-    }
-
-    /**
-     * Handles the watcher directory delete event.
-     *
-     * @private
-     * @param {String} path
-     */
-    _on_directory_delete(path) {
-        // Assert the watcher ignored on this directory
-        if (this._is_watcher_ignored(path)) return;
-
-        // Retrieve the relative path to the directory
-        const relative_uri = this._relative_uri(path);
-
-        // Expire schema & delete the directory's record from the directory map
-        this.#schema = null;
-        delete this.#directories[relative_uri];
-
-        // Emit the directory delete event if it is not supressed
-        if (!this._depress(relative_uri, 'directory_delete', 1)) this.emit('directory_delete', relative_uri);
-    }
-
-    /**
-     * Handles the watcher file add event.
-     *
-     * @private
-     * @param {String} path
-     * @param {FileSystem.Stats} stats
-     * @param {Boolean} is_change
-     */
-    async _on_file_add(path, stats, is_change = false) {
-        // Assert the watcher ignored on this file
-        if (this._is_watcher_ignored(path, stats)) return;
-
-        // Generate the MD5 hash for this file
-        stats.md5 = stats.size > 0 ? await generate_md5_hash(path) : '';
-
-        // Retrieve the relative path to the directory
-        const object = this._object_stats(path, stats);
-        if (object) {
-            // Ensure the file size is less than the maximum file size limit
-            const { max_file_size } = this.#options.limits;
-            if (max_file_size && stats.size > max_file_size) {
-                // Ensure we cleanup any existing record if the file size is too large
-                if (this.#files[object.uri]) delete this.#files[object.uri];
-                return this.emit('file_size_limit', object.uri, object);
-            }
-
-            // Expire schema & store the object by the relative path aka uri
-            this.#schema = null;
-            this.#files[object.uri] = object;
-
-            // Emit the file add or change event if it is not supressed
-            const event = is_change ? 'file_change' : 'file_create';
-            if (!this._depress(object.uri, event, 1)) this.emit(event, object.uri, object);
-        }
-
-        // Emit the 'file_md5' event for any consumers that are listening for a md5 change
-        // Do not supress this event as it is used for file integrity checks by consumers
-        this.emit(`md5_change:${object.uri}`, object);
-    }
-
-    /**
-     * Handles the watcher file delete event.
-     *
-     * @private
-     * @param {String} path
-     */
-    _on_file_delete(path) {
-        // Assert the watcher ignored on this file
-        if (this._is_watcher_ignored(path)) return;
-
-        // Retrieve the relative path to the directory
-        const relative_uri = this._relative_uri(path);
-
-        // Expire schema & delete the file's record from the directory map
-        this.#schema = null;
-        delete this.#files[relative_uri];
-
-        // Emit the file delete event if it is not supressed
-        if (!this._depress(relative_uri, 'file_delete', 1)) this.emit('file_delete', relative_uri);
-    }
-
-    /**
-     * Handles the watcher file change event.
-     *
-     * @private
-     * @param {String} path
-     * @param {FileSystem.Stats} stats
-     */
-    async _on_file_change(path, stats) {
-        // Pass through this event to the file add event but as a change event
-        this._on_file_add(path, stats, true);
-    }
-
-    /* DirectoryMap Getters */
-
-    /**
-     * Returns whether this DirectoryMap instance is destroyed.
-     * @returns {Boolean}
-     */
-    get destroyed() {
-        return this.#destroyed;
-    }
-
-    /**
-     * Returns the root path of this DirectoryMap.
-     * @returns {String}
-     */
-    get path() {
-        return this.#path;
-    }
-
-    #schema;
-
-    /**
-     * Returns a stringified JSON representation of this DirectoryMap as a schematic.
-     * All candidates are sorted in increasing url parts.
-     * Directories come first, files come second.
-     * Directory Structure -> [uri: string]: [created_at: number, updated_at: number]
-     * File Structure -> [uri: string]: [size: number, created_at: number, updated_at: number]
-     * Note! Directories do NOT have a size property at index 0.
-     *
-     * @returns {Object<string, Array<string>>}
+     * @returns {Record<string, Array<string|number>>}
      */
     get schema() {
-        // Resolve from local cache if available
-        if (this.#schema) return this.#schema;
-
-        // Build a new schema based on latest available directory/file candidates
-        const schema = {};
-        [this.#directories, this.#files].forEach((records, index) => {
-            Object.keys(records)
-                .sort((left, right) => {
-                    // Sort the records in increasing url parts for hierarchy purposes
-                    const leftParts = left.split('/');
-                    const rightParts = right.split('/');
-                    return leftParts.length - rightParts.length;
-                })
-                .forEach((uri) => {
-                    // Convert each record into a simplified array
-                    const record = records[uri];
-                    const { md5, created_at, modified_at } = record.stats;
-
-                    // Only include the size property for FILES only
-                    schema[uri] = index == 0 ? [created_at, modified_at] : [md5, created_at, modified_at];
-                });
-        });
-
-        // Cache and resolve the newly built schema
-        this.#schema = schema;
-        return this.#schema;
+        const output = {};
+        for (const [uri, entry] of Object.entries(this.manifest)) {
+            if (entry.type === 'file') output[uri] = [entry.sha256, entry.modified_at, entry.modified_at];
+            else if (entry.type === 'directory') output[uri] = [entry.modified_at, entry.modified_at];
+        }
+        return output;
     }
 
-    /**
-     * Returns the chokidar watcher instance.
-     * @returns {Chokidar}
-     */
-    get watcher() {
-        return this.#watcher;
+    /** @returns {object} JSON-safe options sent to mirrors; local filter functions are intentionally excluded. */
+    get serializable_options() {
+        const filter = (value) => (typeof value === 'function' ? {} : value);
+        return {
+            filters: {
+                keep: filter(this.#options.filters.keep),
+                ignore: filter(this.#options.filters.ignore),
+            },
+            watcher: {
+                atomic: this.#options.watcher.atomic,
+                usePolling: this.#options.watcher.usePolling,
+                awaitWriteFinish: this.#options.watcher.awaitWriteFinish,
+                alwaysStat: true,
+                followSymlinks: false,
+            },
+            limits: { ...this.#options.limits },
+            state: { max_tombstones: this.#options.state.max_tombstones },
+            hashing: { ...this.#options.hashing },
+        };
     }
 
-    /**
-     * Returns the options used to initialize this DirectoryMap.
-     * @returns {DirectoryMapOptions}
-     */
-    get options() {
-        return this.#options;
+    /** @returns {Promise<void>} Resolves after the initial scan and offline-deletion recovery. */
+    ready() {
+        return this.#ready_promise;
     }
 
-    /**
-     * Returns all the directories in this DirectoryMap.
-     * @returns {Object<string, MapRecord>}
-     */
-    get directories() {
-        return this.#directories;
+    /** @returns {Promise<void>} Closes watcher, queues, and durable state. Idempotent. */
+    async destroy() {
+        if (this.#destroyed) return;
+        this.#destroyed = true;
+        this.#hash_queue.close();
+        this.#serial.close();
+        await this.#watcher?.close();
+        while (this.#pending.size) await Promise.allSettled([...this.#pending]);
+        await this.#serial.idle();
+        await this.#state.close();
+        this.removeAllListeners();
     }
 
-    /**
-     * Returns all the files in this DirectoryMap.
-     * @returns {Object<string, MapRecord>}
-     */
-    get files() {
-        return this.#files;
-    }
-
-    /**
-     * Returns all the supressed events in this DirectoryMap.
-     * @returns {Object}
-     */
-    get supressions() {
-        return this.#supressions;
-    }
+    /** @returns {boolean} Whether destroy() has started. */
+    get destroyed() { return this.#destroyed; }
+    /** @returns {string} Absolute synchronized root. */
+    get path() { return this.#path; }
+    /** @returns {import('chokidar').FSWatcher} Underlying Chokidar watcher. */
+    get watcher() { return this.#watcher; }
+    /** @returns {import('../../../index.js').DirectoryMapOptions} Effective options. */
+    get options() { return this.#options; }
+    /** @returns {Record<string, import('../../../index.js').MapRecord>} Active directories keyed by URI. */
+    get directories() { return this.#directories; }
+    /** @returns {Record<string, import('../../../index.js').MapRecord>} Active files keyed by URI. */
+    get files() { return this.#files; }
+    /** @returns {Record<string, {amount: number, updated_at: number}>} Backward-compatible event suppression records. */
+    get supressions() { return { ...this.#legacy_supressions }; }
+    /** @returns {StateStore} Durable active-entry and tombstone store. */
+    get state() { return this.#state; }
 }

@@ -1,657 +1,603 @@
-import fetch from 'node-fetch';
-import Path from 'path';
-import Stream from 'stream';
+import Crypto, { randomUUID } from 'node:crypto';
+import EventEmitter from 'node:events';
+import FileSystem from 'node:fs/promises';
+import Path from 'node:path';
 import Websocket from 'ws';
-import JustQueue from 'just-queue';
-import FileSystem from 'fs/promises';
-import EventEmitter from 'events';
 import DirectoryMap from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
-
 import {
-    wrap_object,
-    to_forward_slashes,
-    is_accessible_path,
-    async_for_each,
+    ACTOR_HEADER,
+    AUTH_HEADER,
+    HASH_HEADER,
+    MODIFIED_HEADER,
+    PROTOCOL_HEADER,
+    PROTOCOL_VERSION,
+} from '../constants.js';
+import { KeyedQueue, TaskQueue } from '../utils/queues.js';
+import {
+    abort_error,
     async_wait,
+    compare_entries,
+    entries_equivalent,
+    entry_timestamp,
+    merge_options,
     safe_json_parse,
+    validate_entry,
 } from '../utils/operators.js';
 
-// This will hold the shared websocket connections to remote servers
-// We will ideally only want a single connection for multiple hosts on the same remote server
-const ws_pool = {};
+const DEFAULT_OPTIONS = {
+    path: '',
+    hostname: '',
+    port: 8080,
+    ssl: false,
+    auth: '',
+    retry: { every: 1_000, backoff: true },
+    queue: {
+        max_concurrent: 10,
+        max_queued: Infinity,
+        timeout: Infinity,
+        throttle: { rate: Infinity, interval: Infinity },
+    },
+    state: {},
+    hashing: {},
+    watcher: {},
+    filters: undefined,
+};
 
-// Bind a global close handler to close all websocket connections
-['exit', 'SIGINT', 'SIGUSR1', 'SIGUSR2', 'SIGTERM', 'uncaughtException'].forEach((type) =>
-    process.once(type, (arg1) => {
-        if (type === 'uncaughtException') console.error(arg1);
-        Object.keys(ws_pool).forEach((key) => ws_pool[key].close());
-        process.exit();
-    })
-);
+const websocket_pool = new Map();
 
-export default class Mirror extends EventEmitter {
-    #ws;
-    #map;
-    #host;
-    #queue;
-    #manager;
-    #destroyed = false;
-    #options = {
-        path: '',
-        hostname: '',
-        port: 8080,
-        ssl: false,
-        auth: '',
-        retry: {
-            every: 1000,
-            backoff: true,
-        },
-        queue: {
-            max_concurrent: 10,
-            max_queued: Infinity,
-            timeout: Infinity,
-            throttle: {
-                rate: Infinity,
-                interval: Infinity,
+function pool_identity(options) {
+    const scheme = options.ssl ? 'wss' : 'ws';
+    const auth = Crypto.createHash('sha256').update(options.auth).digest('hex');
+    return `${scheme}://${options.hostname}:${options.port}/${auth}`;
+}
+
+/**
+ * Multiplexes repository event subscriptions over one socket per endpoint and
+ * authentication identity. This avoids one WebSocket allocation per Mirror.
+ */
+class PooledWebsocket {
+    #attempt = 0;
+    #closed = false;
+    #ever_opened = false;
+    #identity;
+    #options;
+    #pending_subscriptions = new Map();
+    #reconnect_timer;
+    #socket;
+    #subscriptions = new Map();
+
+    constructor(identity, options) {
+        this.#identity = identity;
+        this.#options = options;
+    }
+
+    add(mirror) {
+        let mirrors = this.#subscriptions.get(mirror.host);
+        if (!mirrors) this.#subscriptions.set(mirror.host, (mirrors = new Set()));
+        mirrors.add(mirror);
+        if (this.#socket?.readyState === Websocket.OPEN)
+            this._subscribe(mirror.host, [mirror], false);
+        else this._connect();
+    }
+
+    remove(mirror) {
+        const mirrors = this.#subscriptions.get(mirror.host);
+        mirrors?.delete(mirror);
+        if (mirrors?.size === 0) this.#subscriptions.delete(mirror.host);
+        if (this.#subscriptions.size) return;
+        this.#closed = true;
+        if (this.#reconnect_timer) clearTimeout(this.#reconnect_timer);
+        this.#reconnect_timer = undefined;
+        this.#socket?.close(1000, 'No subscriptions');
+        websocket_pool.delete(this.#identity);
+    }
+
+    _subscribe(host, mirrors, reconnect) {
+        // Do not declare a mirror connected until Server acknowledges SUBSCRIBE.
+        // The subsequent hard sync closes the manifest-to-subscription race.
+        let pending = this.#pending_subscriptions.get(host);
+        if (!pending) this.#pending_subscriptions.set(host, (pending = new Map()));
+        for (const mirror of mirrors) pending.set(mirror, reconnect);
+        this.#socket.send(JSON.stringify({ command: 'SUBSCRIBE', host }));
+    }
+
+    _all_mirrors() {
+        return [...this.#subscriptions.values()].flatMap((mirrors) => [...mirrors]);
+    }
+
+    _connect() {
+        if (
+            this.#closed ||
+            this.#socket?.readyState === Websocket.OPEN ||
+            this.#socket?.readyState === Websocket.CONNECTING
+        ) return;
+        const { auth, hostname, port, ssl } = this.#options;
+        const socket = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}/v3/events`, {
+            headers: {
+                [AUTH_HEADER]: auth,
+                [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
+                [ACTOR_HEADER]: `pool-${this.#identity.slice(-16)}`,
             },
-        },
-    };
+        });
+        this.#socket = socket;
+        socket.on('open', () => {
+            const reconnect = this.#ever_opened;
+            this.#ever_opened = true;
+            this.#attempt = 0;
+            for (const [host, mirrors] of this.#subscriptions)
+                this._subscribe(host, mirrors, reconnect);
+        });
+        socket.on('message', (raw) => {
+            const message = safe_json_parse(String(raw));
+            if (message?.command === 'SUBSCRIBED' && message.protocol === PROTOCOL_VERSION) {
+                const pending = this.#pending_subscriptions.get(message.host);
+                this.#pending_subscriptions.delete(message.host);
+                for (const [mirror, reconnect] of pending || []) {
+                    if (this.#subscriptions.get(message.host)?.has(mirror))
+                        mirror._on_socket_ready(reconnect);
+                }
+                return;
+            }
+            if (message?.command !== 'MUTATION' || message.protocol !== PROTOCOL_VERSION) return;
+            for (const mirror of this.#subscriptions.get(message.host) || [])
+                mirror._receive_mutation(message);
+        });
+        socket.on('error', (error) => {
+            for (const mirror of this._all_mirrors()) mirror._emit_error(error);
+        });
+        socket.on('close', () => {
+            if (this.#socket === socket) this.#socket = undefined;
+            this.#pending_subscriptions.clear();
+            if (this.#closed || !this.#subscriptions.size) return;
+            const retry = this.#options.retry;
+            const base = retry.backoff ? retry.every * 2 ** this.#attempt++ : retry.every;
+            const delay = Math.min(30_000, Math.max(0, base)) * (0.8 + Math.random() * 0.4);
+            this.#reconnect_timer = setTimeout(() => {
+                this.#reconnect_timer = undefined;
+                this._connect();
+            }, delay);
+            this.#reconnect_timer.unref?.();
+        });
+    }
+}
 
-    constructor(host, options = this.#options) {
-        // Initialize the Event Emitter instance
+function effective_ref(manifest, uri) {
+    // A directory tombstone is also the effective entry for older descendants.
+    // Returning its own URI deduplicates a whole deleted subtree into one action.
+    let selected = manifest[uri] ? { uri, entry: manifest[uri] } : undefined;
+    let parent = Path.posix.dirname(uri);
+    while (parent && parent !== '/') {
+        const candidate = manifest[parent];
+        if (
+            candidate?.type === 'tombstone' &&
+            candidate.target === 'directory' &&
+            (!selected || candidate.deleted_at >= entry_timestamp(selected.entry))
+        ) selected = { uri: parent, entry: candidate };
+        const next = Path.posix.dirname(parent);
+        if (next === parent) break;
+        parent = next;
+    }
+    return selected;
+}
+
+function action_priority(entry) {
+    if (entry.type === 'tombstone') return 0;
+    if (entry.type === 'directory') return 1;
+    return 2;
+}
+
+/**
+ * Bidirectional repository node backed by a Server authority.
+ *
+ * Local watcher mutations are pushed to the authority. Accepted server entries
+ * are pulled over HTTP and applied atomically, while WebSocket messages provide
+ * low-latency invalidation. Full manifests are reconciled at startup and after
+ * each confirmed socket connection so WebSocket delivery is never the sole
+ * source of truth.
+ *
+ * @extends EventEmitter
+ */
+export default class Mirror extends EventEmitter {
+    #abort_controller = new AbortController();
+    #actor = randomUUID();
+    #destroy_promise;
+    #destroyed = false;
+    #event_chain = Promise.resolve();
+    #host;
+    #manager;
+    #map;
+    #options;
+    #pool;
+    #ready_promise;
+    #reconcile_again = false;
+    #reconcile_promise;
+    #transfer_queue;
+    #work = new KeyedQueue();
+
+    /**
+     * Creates a mirror and begins its initial authority reconciliation.
+     *
+     * @param {string} host Name passed to Server.host().
+     * @param {import('../../index.js').MirrorOptions} [options={}] Local path, endpoint, authentication, and queue options.
+     */
+    constructor(host, options = {}) {
         super();
-
-        // Ensure the host name is valid
-        if (typeof host !== 'string')
-            throw new Error('new DirectorySync.Mirror(host, options) -> host must be a valid string.');
-
-        // Wrap default options object with provided options
-        if (options === null || typeof options !== 'object')
-            throw new Error('new DirectorySync.Mirror(options) -> options must be an object');
-
-        // Initialize the mirror instance
+        if (typeof host !== 'string' || !host)
+            throw new TypeError('new DirectorySync.Mirror(host, options) -> host must be a non-empty string.');
+        if (!options || typeof options !== 'object')
+            throw new TypeError('new DirectorySync.Mirror(host, options) -> options must be an object.');
         this.#host = host;
-        wrap_object(this.#options, options);
-
-        // Initialize the network queue
-        this.#queue = new JustQueue(this.#options.queue);
-
-        // Initialize local actors
-        this._initialize_actors();
+        this.#options = merge_options(DEFAULT_OPTIONS, options);
+        if (typeof this.#options.path !== 'string' || !this.#options.path)
+            throw new TypeError('Mirror path must be a non-empty string.');
+        if (typeof this.#options.hostname !== 'string' || !this.#options.hostname)
+            throw new TypeError('Mirror hostname must be a non-empty string.');
+        if (!Number.isInteger(this.#options.port) || this.#options.port < 1 || this.#options.port > 65_535)
+            throw new TypeError('Mirror port must be an integer between 1 and 65535.');
+        if (!Number.isFinite(this.#options.retry.every) || this.#options.retry.every < 0)
+            throw new TypeError('retry.every must be a non-negative number.');
+        this.#transfer_queue = new TaskQueue({
+            concurrency: this.#options.queue.max_concurrent,
+            maximum: this.#options.queue.max_queued,
+            timeout: this.#options.queue.timeout,
+            throttle: this.#options.queue.throttle,
+        });
+        this.#ready_promise = this._initialize();
+        this.#ready_promise.catch((error) => this._emit_error(error));
     }
 
-    /**
-     * Destroys this Mirror instance.
-     *
-     * @returns {Promise}
-     */
-    async destroy() {
-        // Destroy the DirectoryMap instance
-        await this.#map.destroy();
+    /** @returns {string} Remote repository name. */
+    get host() { return this.#host; }
 
-        // Mark this instance as destroyed
-        this.#destroyed = true;
-    }
-
-    /**
-     * Emits a 'log' event with the specified code/message.
-     *
-     * @private
-     * @param {String} code
-     * @param {String} message
-     */
+    /** @protected @param {string} code Log category. @param {string} message Human-readable detail. @returns {void} */
     _log(code, message) {
         this.emit('log', code, message);
     }
 
-    /**
-     * Initialize the DirectoryMap and DirectoryManager instances.
-     * @private
-     */
-    async _initialize_actors() {
-        // Translate the user provided path into an absolute system path
-        let { path } = this.#options;
-        path = to_forward_slashes(Path.resolve(path));
+    /** @protected @param {Error} error Transfer or watcher error. @returns {void} */
+    _emit_error(error) {
+        if (this.#destroyed && error?.name === 'AbortError') return;
+        this.emit('error', error);
+    }
 
-        // Create the directory at path if not specified
-        if (!(await is_accessible_path(path))) await FileSystem.mkdir(path);
+    async _initialize() {
+        const root = Path.resolve(this.#options.path);
+        await FileSystem.mkdir(root, { recursive: true });
+        const response = await this._request('GET', '/v3/manifest');
+        const remote = await response.json();
+        if (remote.protocol !== PROTOCOL_VERSION || !remote.manifest)
+            throw new Error(`Remote does not support DirectorySync protocol v${PROTOCOL_VERSION}.`);
 
-        // Retrieve remote host map options and schema
-        const response = await this._http_request('GET');
-        const { options, schema } = await response.json();
-
-        // Initialize a DirectoryMap locally to compare with remote
-        options.path = this.#options.path;
-        this.#map = new DirectoryMap(options);
+        const map_options = merge_options(remote.options || {}, {
+            path: root,
+            state: this.#options.state,
+            hashing: this.#options.hashing,
+            watcher: this.#options.watcher,
+        });
+        if (this.#options.filters !== undefined) map_options.filters = this.#options.filters;
+        this.#map = new DirectoryMap(map_options);
         this.#manager = new DirectoryManager(this.#map, true);
-
-        // Bind a 'error' handler to pipe errors
-        this.#map.on('error', (error) => this.emit('error', error));
-
-        // Bind a 'file_size_limit' handler to log the event
-        this.#map.on('file_size_limit', (uri, object) =>
-            this._log(
-                'SIZE_LIMIT_REACHED',
-                `${uri} - SIZE_${object.stats.size}_BYTES > LIMIT_${this.#map.options.limits.max_file_size}_BYTES`
-            )
+        this.#map.on('error', (error) => this._emit_error(error));
+        this.#map.on('log', (code, message) => this._log(code, message));
+        this.#map.on('file_size_limit', (uri, record) =>
+            this._log('SIZE_LIMIT_REACHED', `${uri} - SIZE_${record.stats.size}_BYTES`)
         );
-
-        // Wait for the map to be ready before performing synchronization
         await this.#map.ready();
+        await this._perform_hard_sync(remote.manifest, true);
+        this.#map.on('mutation', (uri, entry) => this._handle_local_mutation(uri, entry));
 
-        // Perform a hard sync to ensure all files/directories are in sync
-        await this._perform_hard_sync(schema);
-
-        // Bind mutation listeners to the DirectoryMap
-        this._bind_mutation_listeners();
-
-        // Initialize the websocket uplink to receive host events from the remote server
-        this._initialize_ws_uplink();
-    }
-
-    #ws_cooldown;
-
-    /**
-     * Initializes the websocket uplink to receive host events from the remote server.
-     *
-     * @private
-     * @param {Boolean} pooling
-     */
-    async _initialize_ws_uplink(pooling = true) {
-        // Determine a unique hostname:port:host key for sharing ws connections
-        const reference = this;
-        const { auth, ssl, hostname, port, retry } = this.#options;
-        const identity = `${hostname}:${port}`;
-        const is_initial = this.#ws === undefined;
-        if (pooling && ws_pool[identity]) {
-            // Re-use the shared ws connection
-            this.#ws = ws_pool[identity];
-
-            // Wait for the pooled connection to either open or close
-            await new Promise((resolve) => {
-                // Create a passthrough resolve reference which we can nullify  after use
-                let _resolve = resolve;
-
-                // If the connection was already opened, then resolve immediately
-                if (reference.#ws.readyState === Websocket.OPEN) {
-                    _resolve();
-                    _resolve = null;
-                }
-
-                // Listen for the 'open' event to know when the connection is ready
-                reference.#ws.on('open', () => {
-                    // Resolve the state promise if it has not already been resolved
-                    if (_resolve) {
-                        _resolve();
-                        _resolve = null;
-                    }
-                });
-
-                // Listen for the 'close' event to handle reconnection
-                const { every, backoff } = retry;
-                reference.#ws.once('close', async () => {
-                    // Resolve the state promise if it has not already been resolved
-                    if (_resolve) {
-                        _resolve();
-                        _resolve = null;
-                    }
-
-                    // Wait for the cooldown to expire before attempting to reconnect
-                    const cooldown = reference.#ws_cooldown || every;
-                    reference._log(
-                        'WEBSOCKET',
-                        `DISCONNECTED - ${hostname}:${port} - ${reference.#host}${
-                            reference.#destroyed ? '' : ` - RETRY[${cooldown}ms`
-                        }]`
-                    );
-
-                    // Do not continue the retry cycle if instance is destroyed
-                    if (reference.#destroyed) return;
-
-                    // Retry the connection uplink after waiting the cooldown milliseconds
-                    if (cooldown > 0) await async_wait(cooldown + 1);
-                    reference.#ws_cooldown = backoff ? cooldown * 2 : cooldown;
-                    reference._initialize_ws_uplink();
-                });
-            });
-
-            // Ensure the pooled connection successfully opened
-            if (this.#ws.readyState === Websocket.OPEN) {
-                // Subscribe to the remote server's events for this host
-                reference.#ws.send(
-                    JSON.stringify({
-                        command: 'SUBSCRIBE',
-                        host: this.#host,
-                    })
-                );
-
-                // Perform a hard sync to ensure all files/directories are in sync
-                if (!is_initial) reference._perform_hard_sync();
-            }
-        } else {
-            // Initialize a websocket connection to the remote server
-            const reference = this;
-            const connection = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}/?auth_key=${auth}`);
-            this.#ws = connection;
-
-            // Store the ws connection in the ws pool
-            ws_pool[identity] = connection;
-
-            // Handle the 'open' event
-            connection.once('open', () => {
-                // Reset the ws cooldown for future retries
-                reference.#ws_cooldown = 0;
-                reference._log('WEBSOCKET', `CONNECTED - ${hostname}:${port}`);
-
-                // Subscribe to the remote server's events for this host
-                connection.send(
-                    JSON.stringify({
-                        command: 'SUBSCRIBE',
-                        host: reference.#host,
-                    })
-                );
-
-                // Perform a hard sync to ensure all files/directories are in sync
-                if (!is_initial) reference._perform_hard_sync();
-            });
-
-            // Handle the 'error' event
-            connection.once('error', (error) => this.emit('error', error));
-
-            // Handle the 'close' event to handle reconnection
-            const { every, backoff } = retry;
-            connection.once('close', async () => {
-                // Wait for the cooldown to expire before attempting to reconnect
-                const cooldown = reference.#ws_cooldown || every;
-                reference._log(
-                    'WEBSOCKET',
-                    `DISCONNECTED - ${hostname}:${port} - ${reference.#host}${
-                        reference.#destroyed ? '' : ` - RETRY[${cooldown}ms`
-                    }]`
-                );
-
-                // Do not continue the retry cycle if instance is destroyed
-                if (reference.#destroyed) return;
-
-                // Retry the connection uplink after waiting the cooldown milliseconds
-                if (cooldown > 0) await async_wait(cooldown);
-                reference.#ws_cooldown = backoff ? cooldown * 2 : cooldown;
-                reference._initialize_ws_uplink(false);
-            });
+        const identity = pool_identity(this.#options);
+        this.#pool = websocket_pool.get(identity);
+        if (!this.#pool) {
+            this.#pool = new PooledWebsocket(identity, this.#options);
+            websocket_pool.set(identity, this.#pool);
         }
-
-        // Handle the 'message' event to handle incoming events
-        this.#ws.on('message', (buffer) => {
-            // Safely parse incoming command as JSON and handle it based message.command
-            const message = safe_json_parse(buffer.toString());
-            if (message)
-                switch (message.command) {
-                    case 'MUTATION':
-                        // Handle the incoming mutation event
-                        const { host, type, uri, md5, is_directory } = message;
-
-                        // Ensure the incoming event is for this host as we may be sharing the websocket connection
-                        if (this.#host === host) reference._handle_remote_mutation(type, uri, md5, is_directory);
-                        break;
-                }
-        });
+        this.#pool.add(this);
+        return this;
     }
 
-    /**
-     * Binds listeners to all DirectoryMap events for mutating changes to remote.
-     * @private
-     */
-    _bind_mutation_listeners() {
-        const reference = this;
-
-        // Bind a listener for 'directory_create' events
-        this.#map.on('directory_create', (uri) => this._create_remote_directory(uri));
-
-        // Bind a listener for 'directory_delete' events
-        this.#map.on('directory_delete', async (uri) => {
-            // Make an HTTP request to delete the directory on the remote server
-            const start_time = Date.now();
-            await reference._http_request('DELETE', uri);
-            reference._log('DELETE', `${uri} - DIRECTORY - ${Date.now() - start_time}ms`);
-        });
-
-        // Bind a listener for 'file_create' events
-        this.#map.on('file_create', async (uri, { stats }) => {
-            // Make an HTTP request to create the directory on the remote server
-            const start_time = Date.now();
-            await reference._http_request(
-                'PUT',
-                uri,
-                {},
-                JSON.stringify([stats.size, stats.created_at, stats.modified_at])
-            );
-            reference._log('CREATE', `${uri} - FILE - ${Date.now() - start_time}ms`);
-        });
-
-        // Bind a listener for 'file_change' events
-        this.#map.on('file_change', (uri) => this._upload_file(uri));
-
-        // Bind a listener for 'file_delete' events
-        this.#map.on('file_delete', async (uri) => {
-            // Make an HTTP request to delete the directory on the remote server
-            const start_time = Date.now();
-            await reference._http_request('DELETE', uri);
-            reference._log('DELETE', `${uri} - FILE - ${Date.now() - start_time}ms`);
-        });
+    _url(endpoint, uri) {
+        const url = new URL(
+            `http${this.#options.ssl ? 's' : ''}://${this.#options.hostname}:${this.#options.port}${endpoint}`
+        );
+        url.searchParams.set('host', this.#host);
+        if (uri) url.searchParams.set('uri', uri);
+        return url;
     }
 
-    /**
-     * Handles incoming remote MUTATION command to synchronize remote->local.
-     *
-     * @param {('CREATE'|'MODIFIED'|'DELETE')} type
-     * @param {String} uri
-     * @param {String} md5
-     * @param {Boolean} is_directory
-     */
-    async _handle_remote_mutation(type, uri, md5, is_directory = true) {
-        // Handle mutation event if it's actor id does not match the self id
-        switch (type) {
-            case 'CREATE':
-                // Create the directory/file with local manager
-                this.#manager.create(uri, is_directory);
-                this._log('CREATE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
-                break;
-            case 'MODIFIED':
-                // Compare the incoming md5 with the local md5
-                const record = this.#map.get(uri);
-                if (record) {
-                    // If the local_md5 matches incoming md5, skip the mutation
-                    const local_md5 = record.stats.md5;
-                    if (local_md5 === md5) return;
+    async _request(method, endpoint, options = {}) {
+        let attempt = 0;
+        while (!this.#destroyed) {
+            let body;
+            try {
+                body = options.body_factory ? await options.body_factory() : options.body;
+                const headers = {
+                    [AUTH_HEADER]: this.#options.auth,
+                    [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
+                    [ACTOR_HEADER]: this.#actor,
+                    ...options.headers,
+                };
+                if (options.json !== undefined) {
+                    body = JSON.stringify(options.json);
+                    headers['content-type'] = 'application/json';
                 }
-
-                // Download the file from remote as it has been modified
-                this._download_file(uri);
-                break;
-            case 'DELETE':
-                // Delete the directory/file with local manager
-                this.#manager.delete(uri, is_directory);
-                this._log('DELETE', `${uri} - SERVER - ${is_directory ? 'DIRECTORY' : 'FILE'}`);
-                break;
-        }
-    }
-
-    /**
-     * Performs a hard files/directories sync with the remote server.
-     *
-     * @private
-     * @param {Object=} schema
-     */
-    async _perform_hard_sync(schema) {
-        // Retrieve a fresh schema from the remote server if one is not provided
-        const promises = [];
-        const reference = this;
-        const start_time = Date.now();
-        const local_schema = this.#map.schema;
-        this._log('HARD_SYNC', `START`);
-        if (schema === undefined) {
-            // Retrieve remote host map options and schema
-            const response = await this._http_request('GET');
-            schema = (await response.json()).schema;
-        }
-
-        // Perform local->remote synchronization based on schemas
-        // We will only sync if the remote server has no record at all for each local record
-        await async_for_each(Object.keys(local_schema), async (uri, next) => {
-            const remote_record = schema[uri];
-            const local_record = local_schema[uri];
-            const is_directory = local_record.length === 2;
-
-            // Determine if the remote record is not defined at all
-            if (remote_record === undefined) {
-                if (is_directory) {
-                    // Create a remote directory as it does not exist in remote server
-                    await reference._create_remote_directory(uri);
-                } else {
-                    // Upload the local file to remote server as it does not exist in remote server
-                    promises.push(reference._upload_file(uri));
+                const init = { method, headers, body, signal: this.#abort_controller.signal };
+                if (body && typeof body.pipe === 'function') init.duplex = 'half';
+                const response = await fetch(this._url(endpoint, options.uri), init);
+                if ([408, 425, 429].includes(response.status) || response.status >= 500) {
+                    await response.body?.cancel().catch(() => undefined);
+                    const error = new Error(`HTTP ${response.status}`);
+                    error.retryable = true;
+                    throw error;
                 }
+                if ([401, 403, 413, 422, 426].includes(response.status)) {
+                    const payload = await response.json().catch(() => ({}));
+                    const error = new Error(payload.message || `HTTP ${response.status}`);
+                    error.code = payload.code || `HTTP_${response.status}`;
+                    error.status = response.status;
+                    throw error;
+                }
+                return response;
+            } catch (error) {
+                body?.destroy?.();
+                if (this.#destroyed || this.#abort_controller.signal.aborted) throw abort_error();
+                if (!error.retryable && error.status) throw error;
+                if (['ENOENT', 'EACCES', 'EPERM'].includes(error.code)) throw error;
+                const retry = this.#options.retry;
+                const base = retry.backoff ? retry.every * 2 ** attempt++ : retry.every;
+                const delay = Math.min(30_000, Math.max(0, base)) * (0.8 + Math.random() * 0.4);
+                this._log('HTTP', `ERROR - ${method} ${endpoint} - ${error.message} - RETRY[${Math.round(delay)}ms]`);
+                await async_wait(delay, this.#abort_controller.signal);
             }
-
-            // Proceed to next record
-            next();
-        });
-
-        // Perform remote->local synchronization based on schemas
-        // We will sync based on whether local or remote is newer calculated by the higher created_at/modified_at timestamp
-        await async_for_each(Object.keys(schema), async (uri, next) => {
-            // Determine the local and remote schema records
-            const remote_record = schema[uri];
-            const local_record = local_schema[uri];
-            const is_directory = remote_record.length === 2;
-
-            // Handle case where local remote record is a directory
-            if (is_directory) {
-                // Create the directory if it doesn't exist
-                // We want to await this operation as directories are essential before files can be written
-                if (local_record === undefined) {
-                    await reference.#manager.create(uri, true);
-                    reference._log('CREATE', `${uri} - DIRECTORY`);
-                }
-            } else {
-                // Destructure the remote record into components [SIZE, CREATED_AT, MODIFIED_AT]
-                const [r_md5, r_cat, r_mat] = remote_record;
-
-                // Determine the sync direction for this file record
-                // Sync Direction: 0 - No Sync, 1 - Upload, -1 - Download
-                let sync_direction = local_record === undefined ? -1 : 0;
-                if (local_record) {
-                    // Determine if the MD5 hash of the local file matches the remote file
-                    const [l_md5, l_cat, l_mat] = local_record;
-                    if (l_md5 !== r_md5) {
-                        // Give priority to the modified at timestamp if the MD5 hashes do not match
-                        // Fall back to created at timestamp if modified at timestamp is not available as it is less accurate but is a last resort
-                        if (l_mat && r_mat) {
-                            sync_direction = l_mat < r_mat ? -1 : 1;
-                        } else if (l_cat && r_cat) {
-                            sync_direction = l_cat < r_cat ? -1 : 1;
-                        }
-                    }
-                }
-
-                // Perform the sync operation
-                switch (sync_direction) {
-                    case -1:
-                        // Download the file without holding local execution
-                        promises.push(reference._download_file(uri));
-                        break;
-                    case 1:
-                        // Upload the file without holding local execution
-                        promises.push(reference._upload_file(uri));
-                        break;
-                }
-            }
-
-            // Proceed to next record
-            next();
-        });
-
-        // Wait for all promises to resolve if we have some promises
-        if (promises.length > 0) await Promise.all(promises);
-
-        // Emit a completion log
-        this._log('HARD_SYNC', `COMPLETE - ${Date.now() - start_time}ms`);
+        }
+        throw abort_error();
     }
 
-    /**
-     * Makes an HTTP request to the remote server.
-     *
-     * @private
-     * @param {('GET'|'POST'|'PUT'|'DELETE')} method
-     * @param {String} uri
-     * @param {Object} headers
-     * @param {Stream.Readable} body
-     * @returns {fetch.Response}
-     */
-    async _http_request(method, uri, headers, body, retry_delay) {
-        // Destructure options to retrive constructor options
-        const { hostname, port, ssl, auth } = this.#options;
+    _schedule(uri, handler) {
+        return this.#work.run(uri, () =>
+            this.#transfer_queue.run(handler, this.#abort_controller.signal)
+        );
+    }
 
-        // Safely make the HTTP request
-        let response;
-        try {
-            // Queue the HTTP request in the Network Queue to prevent extensive backpressure
-            response = await this.#queue.queue(() =>
-                fetch(
-                    `http${ssl ? 's' : ''}://${hostname}:${port}?host=${encodeURIComponent(this.#host)}${
-                        uri ? `&uri=${encodeURIComponent(uri)}` : ''
-                    }`,
-                    {
-                        method,
-                        headers: {
-                            ...headers,
-                            'x-auth-key': auth,
-                        },
-                        body,
-                    }
-                )
-            );
+    async _apply_remote(uri, entry) {
+        validate_entry(entry);
+        const local = this.#map.canonical_entry(uri);
+        if (compare_entries(entry, local) === 1) return this._push_local(uri, local, entry);
+        if (entry.type === 'directory') return this.#manager.apply_directory(uri, entry);
+        if (entry.type === 'tombstone') return this.#manager.apply_tombstone(uri, entry);
+        if (
+            local?.type === 'file' &&
+            local.size === entry.size &&
+            local.sha256 === entry.sha256
+        ) return this.#manager.apply_metadata(uri, entry);
 
-            // Check if we received a 403 to alert the user
-            if (response.status === 403) throw new Error('UNAUTHORIZED');
+        const start = Date.now();
+        this._log('DOWNLOAD', `${uri} - FILE - START`);
+        const response = await this._request('GET', '/v3/content', { uri });
+        if (response.status === 404) return;
+        const actual = {
+            type: 'file',
+            modified_at: Number(response.headers.get(MODIFIED_HEADER)),
+            size: Number(response.headers.get('content-length')),
+            sha256: response.headers.get(HASH_HEADER),
+        };
+        validate_entry(actual);
+        if (compare_entries(actual, this.#map.canonical_entry(uri)) === 1) {
+            await response.body?.cancel();
+            return this._push_local(uri, this.#map.canonical_entry(uri), actual);
+        }
+        await this.#manager.apply_file(uri, response.body, actual, {
+            validate_before_commit: () =>
+                compare_entries(actual, this.#map.canonical_entry(uri)) <= 0,
+        });
+        this._log('DOWNLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start}ms`);
+    }
 
-            // Ensure the response code is non 500x
-            if (response.status >= 500 && response.status < 600)
-                throw new Error('HTTP request failed with status code: ' + response.status);
-        } catch (error) {
-            // Throw a higher level error if we received a 403
-            if (error.message === 'UNAUTHORIZED') {
-                const error = new Error(
-                    'Remote Server sent an HTTP 403 meaning your authentication string is invalid.'
-                );
-                this.emit('error', error);
+    async _push_local(uri, entry, remote) {
+        if (!entry) return;
+        validate_entry(entry);
+        // Queue entries are immutable snapshots. If the watcher has already seen
+        // a newer local state, discard this stale transfer instead of uploading
+        // content that no longer corresponds to the path on disk.
+        if (!entries_equivalent(this.#map.canonical_entry(uri), entry)) return;
+        if (entry.type === 'file') {
+            try {
+                if (!(await FileSystem.lstat(this.#map.resolve(uri))).isFile()) return;
+            } catch (error) {
+                if (error.code === 'ENOENT') return;
                 throw error;
             }
-
-            // Retry the request if there are some retries remaining
-            const { every, backoff } = this.#options.retry;
-
-            // Wait for the retry delay if one is provided
-            const cooldown = retry_delay || every;
-            if (cooldown) {
-                this._log('HTTP', `ERROR - ${method} - ${error.message}`);
-                await async_wait(cooldown);
-            }
-
-            // Retry the request with the updated cooldown
-            return await this._http_request(method, uri, headers, body, backoff ? cooldown * 2 : cooldown);
         }
-
-        return response;
-    }
-
-    /**
-     * Creates a directory record with remote server based on local directory.
-     *
-     * @param {String} uri
-     */
-    async _create_remote_directory(uri) {
-        // Make an HTTP request to create the directory on the remote server
-        const start_time = Date.now();
-        const { stats } = this.#map.get(uri);
-        const { created_at, modified_at } = stats;
-        this._log('CREATE', `${uri} - REMOTE_DIRECTORY - START`);
-        await this._http_request('PUT', uri, {}, JSON.stringify([created_at, modified_at]));
-        this._log('CREATE', `${uri} - REMOTE_DIRECTORY - ${Date.now() - start_time}ms`);
-    }
-
-    /**
-     * Returns a readable stream for a file from the remote server.
-     *
-     * @param {String} uri
-     * @returns {Promise<Stream.Readable>}
-     */
-    async _download_file(uri, delay) {
-        // Make the HTTP request to retrieve the file stream
-        const start_time = Date.now();
-        this._log('DOWNLOAD', `${uri} - FILE - START`);
-        const { status, body, headers } = await this._http_request('GET', uri);
-
-        // Perform a follow-up hard sync if we recieve a 404 after retry delay
-        if (status === 404) return this._log('DOWNLOAD', `${uri} - FILE - 404`);
-
-        // Ensure the response status code is valid
-        if (status !== 200) throw new Error(`_download_file(${uri}) -> HTTP ${status}`);
-
-        // Stream the file to the local file system if we receive some content else empty the file
-        try {
-            // Supress the indirect_write to prevent an unneccessary upload
-            const expected_md5 = headers.get('md5-hash') || '';
-            await this.#manager.indirect_write(
+        let response;
+        if (entry.type === 'directory') {
+            response = await this._request('PUT', '/v3/directory', { uri, json: entry });
+        } else if (entry.type === 'tombstone') {
+            response = await this._request('DELETE', '/v3/entry', { uri, json: entry });
+        } else if (
+            remote?.type === 'file' &&
+            remote.size === entry.size &&
+            remote.sha256 === entry.sha256
+        ) {
+            response = await this._request('PATCH', '/v3/content', { uri, json: entry });
+        } else {
+            const start = Date.now();
+            this._log('UPLOAD', `${uri} - FILE - START`);
+            response = await this._request('PUT', '/v3/content', {
                 uri,
-                +headers.get('content-length') === 0 ? '' : body,
-                expected_md5,
-                true
-            );
-        } catch (error) {
-            // Wait for the appropriate cooldown delay before retrying download
-            const { every, backoff } = this.#options.retry;
-            const cooldown = delay || every;
-            this._log('DOWNLOAD', `${uri} - FILE - FAILED - RETRY - ${cooldown}ms`);
-            this.emit('error', error);
-            await async_wait(cooldown);
-
-            // Retry the download with the updated cooldown
-            return await this._download_file(uri, backoff ? cooldown * 2 : cooldown);
+                headers: {
+                    [MODIFIED_HEADER]: String(entry.modified_at),
+                    [HASH_HEADER]: entry.sha256,
+                    'content-length': String(entry.size),
+                },
+                body_factory: entry.size ? () => this.#manager.read(uri, true) : undefined,
+            });
+            this._log('UPLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start}ms`);
         }
-
-        this._log('DOWNLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start_time}ms`);
+        if (response.status === 409) {
+            const payload = await response.json().catch(() => ({}));
+            if (payload.entry) await this._apply_remote(uri, payload.entry);
+        } else {
+            const payload = await response.json().catch(() => ({}));
+            if (payload.entry && !entries_equivalent(payload.entry, entry))
+                await this._apply_remote(uri, payload.entry);
+        }
     }
 
-    /**
-     * Uploads local file at the specified URI to the remote server.
-     *
-     * @param {String} uri
-     */
-    async _upload_file(uri, delay) {
-        // Retrieve a readable stream for the file
-        const start_time = Date.now();
-        this._log('UPLOAD', `${uri} - FILE - START`);
-        const stream = this.#manager.read(uri, true);
+    _plan(remote, local) {
+        // Planning is allocation-bounded to one action per effective URI. The
+        // authority occupies the first compare_entries argument so it wins ties.
+        const actions = new Map();
+        const uris = new Set([...Object.keys(remote), ...Object.keys(local)]);
+        for (const uri of uris) {
+            const server = effective_ref(remote, uri);
+            const mirror = effective_ref(local, uri);
+            const comparison = compare_entries(server?.entry, mirror?.entry);
+            if (comparison === 0) continue;
+            if (comparison < 0 && server) {
+                const key = `pull:${server.uri}`;
+                actions.set(key, {
+                    direction: 'pull',
+                    uri: server.uri,
+                    entry: server.entry,
+                    other: effective_ref(local, server.uri)?.entry,
+                });
+            } else if (comparison > 0 && mirror) {
+                const key = `push:${mirror.uri}`;
+                actions.set(key, {
+                    direction: 'push',
+                    uri: mirror.uri,
+                    entry: mirror.entry,
+                    other: effective_ref(remote, mirror.uri)?.entry,
+                });
+            }
+        }
+        return [...actions.values()].sort((left, right) => {
+            const priority = action_priority(left.entry) - action_priority(right.entry);
+            if (priority) return priority;
+            const depth = left.uri.split('/').length - right.uri.split('/').length;
+            return depth || left.uri.localeCompare(right.uri);
+        });
+    }
 
-        // Make HTTP request to upload the file
-        const { stats } = this.#map.get(uri);
-        const { status } = await this._http_request(
-            'POST',
-            uri,
-            {
-                'content-length': stats.size.toString(),
-                'md5-hash': stats.md5,
-            },
-            stream
+    async _reconcile_once(remote_manifest) {
+        let remote = remote_manifest;
+        if (!remote) {
+            const response = await this._request('GET', '/v3/manifest');
+            const payload = await response.json();
+            if (payload.protocol !== PROTOCOL_VERSION) throw new Error('DirectorySync protocol mismatch.');
+            remote = payload.manifest;
+        }
+        const actions = this._plan(remote, this.#map.manifest);
+        const perform = (action) => this._schedule(action.uri, () =>
+            action.direction === 'pull'
+                ? this._apply_remote(action.uri, action.entry)
+                : this._push_local(action.uri, action.entry, action.other)
         );
-
-        // Determine if a retry is required due to delivery failure
-        if (status === 409) {
-            // Wait for the appropriate cooldown delay
-            const { every, backoff } = this.#options.retry;
-            const cooldown = delay || every;
-            this._log('UPLOAD', `${uri} - FILE - FAILED - RETRY - ${cooldown}ms`);
-            await async_wait(cooldown);
-
-            // Retry the upload with the updated cooldown
-            return await this._upload_file(uri, backoff ? cooldown * 2 : cooldown);
-        }
-
-        // Ensure the response status code is valid
-        if (status !== 200) throw new Error(`_upload_file(${uri}) -> HTTP ${status}`);
-
-        this._log('UPLOAD', `${uri} - FILE - END - ${Date.now() - start_time}ms`);
+        // Tombstones go first to remove stale type conflicts, directories create
+        // parents for files, and a final deepest-first directory metadata pass
+        // restores mtimes changed while child files were written.
+        for (const action of actions)
+            if (action.entry.type === 'tombstone') await perform(action);
+        const directories = actions.filter((action) => action.entry.type === 'directory');
+        await Promise.all(directories.map(perform));
+        await Promise.all(actions.filter((action) => action.entry.type === 'file').map(perform));
+        directories.sort((left, right) => right.uri.split('/').length - left.uri.split('/').length);
+        for (const action of directories) await perform(action);
     }
-
-    /* Mirror Instance Getters */
 
     /**
-     * Returns whether this mirror instance is destroyed.
-     * @returns {Boolean}
+     * Reconciles a complete authority manifest, coalescing overlapping requests.
+     *
+     * @protected
+     * @param {Record<string, import('../../index.js').Entry>} [manifest] Optional already-fetched authority manifest.
+     * @param {boolean} [initial=false] Fetch a second manifest to close the startup scan window.
+     * @returns {Promise<void>}
      */
-    get destroyed() {
-        return this.#destroyed;
+    _perform_hard_sync(manifest, initial = false) {
+        if (this.#reconcile_promise) {
+            this.#reconcile_again = true;
+            return this.#reconcile_promise;
+        }
+        this.#reconcile_promise = (async () => {
+            const start = Date.now();
+            this._log('HARD_SYNC', 'START');
+            await this._reconcile_once(manifest);
+            if (initial) await this._reconcile_once();
+            while (this.#reconcile_again && !this.#destroyed) {
+                this.#reconcile_again = false;
+                await this._reconcile_once();
+            }
+            this._log('HARD_SYNC', `COMPLETE - ${Date.now() - start}ms`);
+        })().finally(() => {
+            this.#reconcile_promise = undefined;
+        });
+        return this.#reconcile_promise;
     }
+
+    _handle_local_mutation(uri, entry) {
+        this._schedule(uri, () => this._push_local(uri, entry))
+            .catch((error) => {
+                if (error.code === 'FILTERED')
+                    return this._log('FILTERED', `${uri} - rejected by authority filter`);
+                if (!this.#destroyed) this._emit_error(error);
+            });
+    }
+
+    /** @protected @param {object} message Protocol-v3 mutation event. @returns {void} */
+    _receive_mutation(message) {
+        if (message.actor === this.#actor || this.#destroyed) return;
+        this.#event_chain = this.#event_chain
+            .catch(() => undefined)
+            .then(() => this._schedule(message.uri, () => this._apply_remote(message.uri, message.entry)));
+        this.#event_chain.catch((error) => {
+            if (!this.#destroyed) this._emit_error(error);
+        });
+    }
+
+    /** @protected @param {boolean} reconnect Whether this socket was previously connected. @returns {void} */
+    _on_socket_ready(reconnect) {
+        this._log('WEBSOCKET', `${reconnect ? 'RECONNECTED' : 'CONNECTED'} - ${this.#options.hostname}:${this.#options.port}`);
+        this._perform_hard_sync().catch((error) => this._emit_error(error));
+    }
+
+    /**
+     * Waits for the local map and initial two-pass manifest reconciliation.
+     *
+     * @returns {Promise<Mirror>} This mirror instance.
+     */
+    ready() {
+        return this.#ready_promise;
+    }
+
+    /**
+     * Stops retries and transfers, leaves the shared event socket, and closes the watcher. Idempotent.
+     *
+     * @returns {Promise<void>}
+     */
+    destroy() {
+        if (this.#destroy_promise) return this.#destroy_promise;
+        this.#destroyed = true;
+        this.#abort_controller.abort();
+        this.#transfer_queue.close();
+        this.#work.close();
+        this.#pool?.remove(this);
+        this.#destroy_promise = (async () => {
+            await this.#ready_promise.catch(() => undefined);
+            await this.#event_chain.catch(() => undefined);
+            await this.#work.idle();
+            await this.#map?.destroy();
+            this.removeAllListeners();
+        })();
+        return this.#destroy_promise;
+    }
+
+    /** @returns {boolean} Whether destroy() has started. */
+    get destroyed() { return this.#destroyed; }
+
+    /** @returns {import('../../index.js').MirrorOptions} Effective mirror options. */
+    get options() { return this.#options; }
+
+    /** @returns {import('../../index.js').DirectoryMap} Live local filesystem map after ready(). */
+    get map() { return this.#map; }
 }
