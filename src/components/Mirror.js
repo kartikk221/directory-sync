@@ -3,7 +3,7 @@ import EventEmitter from 'node:events';
 import FileSystem from 'node:fs/promises';
 import Path from 'node:path';
 import Websocket from 'ws';
-import DirectoryMap from './directory/DirectoryMap.js';
+import DirectoryMap, { compile_filters } from './directory/DirectoryMap.js';
 import DirectoryManager from './directory/DirectoryManager.js';
 import {
     ACTOR_HEADER,
@@ -125,6 +125,7 @@ class PooledWebsocket {
                 [ACTOR_HEADER]: `pool-${this.#identity.slice(-16)}`,
             },
         });
+        const connected = new Set();
         this.#socket = socket;
         socket.on('open', () => {
             const reconnect = this.#ever_opened;
@@ -139,8 +140,10 @@ class PooledWebsocket {
                 const pending = this.#pending_subscriptions.get(message.host);
                 this.#pending_subscriptions.delete(message.host);
                 for (const [mirror, reconnect] of pending || []) {
-                    if (this.#subscriptions.get(message.host)?.has(mirror))
+                    if (this.#subscriptions.get(message.host)?.has(mirror)) {
+                        connected.add(mirror);
                         mirror._on_socket_ready(reconnect);
+                    }
                 }
                 return;
             }
@@ -154,6 +157,8 @@ class PooledWebsocket {
         socket.on('close', () => {
             if (this.#socket === socket) this.#socket = undefined;
             this.#pending_subscriptions.clear();
+            for (const mirror of connected)
+                if (this.#subscriptions.get(mirror.host)?.has(mirror)) mirror._on_socket_close();
             if (this.#closed || !this.#subscriptions.size) return;
             const retry = this.#options.retry;
             const base = retry.backoff ? retry.every * 2 ** this.#attempt++ : retry.every;
@@ -243,6 +248,7 @@ function yield_event_loop() {
 export default class Mirror extends EventEmitter {
     #abort_controller = new AbortController();
     #actor = randomUUID();
+    #authority_allows = () => true;
     #clock_offset = 0;
     #destroy_promise;
     #destroyed = false;
@@ -323,12 +329,12 @@ export default class Mirror extends EventEmitter {
             hashing: this.#options.hashing,
             limits: this.#options.limits,
             watcher: this.#options.watcher,
+            authority_filter: (uri, type) => this.#authority_allows(uri, type),
         });
         if (this.#options.filters !== undefined) map_options.filters = this.#options.filters;
         this.#map = new DirectoryMap(map_options);
         this.#manager = new DirectoryManager(this.#map, true);
         this.#map.on('error', (error) => this._emit_error(error));
-        this.#map.on('log', (code, message) => this._log(code, message));
         this.#map.on('file_size_limit', (uri, record) =>
             this._log('SIZE_LIMIT_REACHED', `${uri} - SIZE_${record.stats.size}_BYTES`)
         );
@@ -363,11 +369,13 @@ export default class Mirror extends EventEmitter {
             !payload.versions || typeof payload.versions !== 'object' ||
             !Number.isSafeInteger(payload.server_time)
         ) throw new Error(`Remote does not support DirectorySync protocol v${PROTOCOL_VERSION}.`);
-        for (const uri of Object.keys(payload.manifest)) {
+        const manifest_uris = Object.keys(payload.manifest);
+        for (const uri of manifest_uris) {
             const revision = payload.versions[uri];
             if (!Number.isSafeInteger(revision) || revision < 0)
                 throw new TypeError(`Manifest revision for ${uri} must be a non-negative safe integer.`);
         }
+        this.#authority_allows = compile_filters(payload.filters || {});
         if (this.#epoch && this.#epoch !== payload.epoch) this.#versions.clear();
         this.#epoch = payload.epoch;
         const offset = Math.round((started + received) / 2 - payload.server_time);
@@ -376,6 +384,7 @@ export default class Mirror extends EventEmitter {
         // from request latency. Treat that uncertainty band as zero so jitter
         // cannot turn an exact mtime tie into a newer Mirror mutation.
         this.#clock_offset = Math.abs(offset) <= uncertainty ? 0 : offset;
+        this._log('MANIFEST', `${this.#host} - ${manifest_uris.length} ENTRIES - ${payload.tombstones.length} TOMBSTONES - ${Date.now() - started}ms`);
         return payload;
     }
 
@@ -445,7 +454,6 @@ export default class Mirror extends EventEmitter {
                 const retry = this.#options.retry;
                 const base = retry.backoff ? retry.every * 2 ** attempt++ : retry.every;
                 const delay = Math.min(30_000, Math.max(0, base)) * (0.8 + Math.random() * 0.4);
-                this._log('HTTP', `ERROR - ${method} ${endpoint} - ${error.message} - RETRY[${Math.round(delay)}ms]`);
                 await async_wait(delay, this.#abort_controller.signal);
             }
         }
@@ -543,6 +551,8 @@ export default class Mirror extends EventEmitter {
     async _push_local(uri, entry, remote) {
         if (!entry) return;
         validate_entry(entry);
+        const type = entry.type === 'tombstone' ? entry.target : entry.type;
+        if (!this.#authority_allows(uri, type)) return;
         // Queue entries are immutable snapshots. If the watcher has already seen
         // a newer local state, discard this stale transfer instead of uploading
         // content that no longer corresponds to the path on disk.
@@ -652,6 +662,10 @@ export default class Mirror extends EventEmitter {
                 ))
             ) server = tombstone;
             const mirror = normalized_local[uri];
+            const mirror_allowed = !mirror || this.#authority_allows(
+                uri,
+                mirror.type === 'tombstone' ? mirror.target : mirror.type
+            );
             if (
                 server?.entry.type === 'file' &&
                 mirror?.type === 'file' &&
@@ -672,7 +686,10 @@ export default class Mirror extends EventEmitter {
                 continue;
             }
             const known = this.#versions.get(uri);
-            if (server?.uri === uri && known !== undefined && known === server.revision && mirror) {
+            if (
+                server?.uri === uri && known !== undefined && known === server.revision &&
+                mirror && mirror_allowed
+            ) {
                 actions.set(`push:${mirror.type}:${uri}`, {
                     direction: 'push',
                     uri,
@@ -688,7 +705,7 @@ export default class Mirror extends EventEmitter {
                     uri: server.uri,
                     record: server,
                 });
-            } else if (comparison > 0 && mirror) {
+            } else if (comparison > 0 && mirror && mirror_allowed) {
                 actions.set(`push:${mirror.type}:${uri}`, {
                     direction: 'push',
                     uri,
@@ -739,7 +756,6 @@ export default class Mirror extends EventEmitter {
                 return true;
             } catch (error) {
                 if (error.code !== 'FILTERED') throw error;
-                this._log('FILTERED', `${action.uri} - rejected by authority filter`);
                 return false;
             }
         });
@@ -776,14 +792,11 @@ export default class Mirror extends EventEmitter {
             return this.#reconcile_promise;
         }
         this.#reconcile_promise = (async () => {
-            const start = Date.now();
-            this._log('HARD_SYNC', 'START');
             await this._reconcile_once(state);
             while (this.#reconcile_again && !this.#destroyed) {
                 this.#reconcile_again = false;
                 await this._reconcile_once();
             }
-            this._log('HARD_SYNC', `COMPLETE - ${Date.now() - start}ms`);
         })().finally(() => {
             this.#reconcile_promise = undefined;
         });
@@ -791,10 +804,11 @@ export default class Mirror extends EventEmitter {
     }
 
     _handle_local_mutation(uri, entry) {
+        const type = entry.type === 'tombstone' ? entry.target : entry.type;
+        if (!this.#authority_allows(uri, type)) return;
         this._schedule(uri, () => this._push_local(uri, entry))
             .catch((error) => {
-                if (error.code === 'FILTERED')
-                    return this._log('FILTERED', `${uri} - rejected by authority filter`);
+                if (error.code === 'FILTERED') return;
                 if (!this.#destroyed) this._emit_error(error);
             });
     }
@@ -825,6 +839,11 @@ export default class Mirror extends EventEmitter {
             return;
         }
         this._perform_hard_sync().catch((error) => this._emit_error(error));
+    }
+
+    /** @protected @returns {void} */
+    _on_socket_close() {
+        this._log('WEBSOCKET', `DISCONNECTED - ${this.#options.hostname}:${this.#options.port}`);
     }
 
     /**

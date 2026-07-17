@@ -25,6 +25,7 @@ test('DirectoryMap indexes files, directories, filters, and user-owned hidden pa
     await write_file(root, '/keep/data.txt', 'kept');
     await write_file(root, '/keep/data.bin', 'ignored');
     await write_file(root, '/ignored/data.txt', 'ignored');
+    await write_file(root, '/nested/ignored/deep/data.txt', 'ignored');
     await write_file(root, '/.directory-sync/user.txt', 'user-owned');
     const { map } = await create_map(t, root, {
         filters: {
@@ -36,6 +37,7 @@ test('DirectoryMap indexes files, directories, filters, and user-owned hidden pa
     assert.equal(map.get('/keep/data.txt').stats.sha256, sha256('kept'));
     assert.equal(map.get('/keep/data.bin'), undefined);
     assert.equal(map.get('/ignored/data.txt'), undefined);
+    assert.equal(map.get('/nested/ignored/deep/data.txt'), undefined);
     assert.equal(map.get('/.directory-sync/user.txt').stats.sha256, sha256('user-owned'));
     assert.equal(map.schema['/keep/data.txt'][0], sha256('kept'));
 });

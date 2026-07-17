@@ -58,7 +58,10 @@ function compile_filter(filter) {
     return (uri, stats, strict = true) => {
         const is_directory = stats.isDirectory();
         const in_directory = directories.some(
-            (candidate) => uri === candidate || uri.startsWith(`${candidate}/`) || uri.endsWith(candidate)
+            (candidate) =>
+                uri === candidate ||
+                uri.endsWith(candidate) ||
+                uri.includes(`${candidate}/`)
         );
         if (in_directory) return true;
         if (is_directory) {
@@ -84,6 +87,20 @@ function stats_adapter(type) {
     };
 }
 
+function compile_filters(filters = {}) {
+    if (!filters || typeof filters !== 'object' || Array.isArray(filters))
+        throw new TypeError('filters must be an object.');
+    const keep = compile_filter(normalize_filter(filters.keep, 'keep'));
+    const ignore = compile_filter(normalize_filter(filters.ignore, 'ignore'));
+    return (uri, type = 'file') => {
+        const canonical = canonicalize_uri(uri);
+        const stats = stats_adapter(type);
+        return !ignore?.(canonical, stats, true) && (!keep || keep(canonical, stats, false));
+    };
+}
+
+export { compile_filters };
+
 function uri_depth(uri) {
     let depth = 0;
     for (let index = 0; index < uri.length; index++)
@@ -101,6 +118,7 @@ function uri_depth(uri) {
  * @extends EventEmitter
  */
 export default class DirectoryMap extends EventEmitter {
+    #authority_filter;
     #destroyed = false;
     #directories = {};
     #expected = new Map();
@@ -134,8 +152,12 @@ export default class DirectoryMap extends EventEmitter {
             throw new TypeError('new DirectoryMap(options.path) -> path must be a non-empty string.');
         if (options.watcher?.followSymlinks === true)
             throw new TypeError('DirectorySync does not follow symbolic links; watcher.followSymlinks must be false.');
+        if (options.authority_filter !== undefined && typeof options.authority_filter !== 'function')
+            throw new TypeError('authority_filter must be a function.');
 
         this.#options = merge_options(DEFAULT_OPTIONS, options);
+        this.#authority_filter = options.authority_filter || (() => true);
+        delete this.#options.authority_filter;
         delete this.#options.state.path;
         this.#options.filters.keep = normalize_filter(this.#options.filters.keep, 'keep');
         this.#options.filters.ignore = normalize_filter(this.#options.filters.ignore, 'ignore');
@@ -171,6 +193,8 @@ export default class DirectoryMap extends EventEmitter {
             if (typeof user_ignored === 'function' && user_ignored(path, stats)) return true;
             if (!stats) return false;
             const uri = this.relative_uri(absolute);
+            const type = stats.isDirectory() ? 'directory' : 'file';
+            if (!this.#authority_filter(uri, type)) return true;
             if (this.#ignore_filter?.(uri, stats, true)) return true;
             return Boolean(this.#keep_filter && !this.#keep_filter(uri, stats, false));
         };
@@ -238,6 +262,7 @@ export default class DirectoryMap extends EventEmitter {
         const canonical = canonicalize_uri(uri);
         const stats = stats_adapter(type);
         return (
+            this.#authority_filter(canonical, type) &&
             !this.#ignore_filter?.(canonical, stats, true) &&
             (!this.#keep_filter || this.#keep_filter(canonical, stats, false))
         );

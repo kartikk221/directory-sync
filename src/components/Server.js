@@ -107,10 +107,7 @@ export default class Server extends EventEmitter {
                 return response.status(500).json({ code: 'UNCAUGHT_ERROR', message: 'Request failed.' });
         });
         this._bind_routes();
-        this.#ready_promise = this.#server.listen(port).then(() => {
-            this._log('STARTUP', `Server started on port ${this.#server.port}`);
-            return this;
-        });
+        this.#ready_promise = this.#server.listen(port).then(() => this);
         this.#ready_promise.catch((error) => this.emit('error', error));
     }
 
@@ -334,20 +331,29 @@ export default class Server extends EventEmitter {
         );
 
         this.#server.get(`${PROTOCOL_PATH}/manifest`, this._route(async (request, response, hosted) => {
-            this._log('SCHEMA', `'${hosted.name}' - ${request.ip}`);
             const manifest = hosted.map.manifest;
+            const manifest_uris = Object.keys(manifest);
             const versions = {};
-            for (const uri of Object.keys(manifest))
+            for (const uri of manifest_uris)
                 versions[uri] = hosted.authority.active.get(uri) || 0;
             const tombstones = hosted.map.tombstones;
             for (const record of tombstones)
                 record.revision = hosted.authority.tombstones.get(
                     this._tombstone_key(record.uri, record.entry.target)
                 ) || 0;
+            this._log('MANIFEST', `${request.ip} - '${hosted.name}' - ${manifest_uris.length} ENTRIES - ${tombstones.length} TOMBSTONES`);
             return response.json({
                 epoch: this.#epoch,
                 protocol: PROTOCOL_VERSION,
                 server_time: Date.now(),
+                filters: {
+                    keep: typeof hosted.map.options.filters.keep === 'function'
+                        ? null
+                        : hosted.map.options.filters.keep,
+                    ignore: typeof hosted.map.options.filters.ignore === 'function'
+                        ? null
+                        : hosted.map.options.filters.ignore,
+                },
                 manifest,
                 tombstones,
                 versions,
@@ -367,7 +373,15 @@ export default class Server extends EventEmitter {
             response.header(EPOCH_HEADER, this.#epoch);
             response.header(REVISION_HEADER, String(record?.revision ?? 0));
             response.header('content-length', String(entry.size));
-            return response.stream(hosted.manager.read(uri, true), entry.size);
+            const started = Date.now();
+            const detail = `${request.ip} - '${hosted.name}' - ${uri} - FILE - ${entry.size} BYTES`;
+            const stream = hosted.manager.read(uri, true);
+            this._log('UPLOAD', `${detail} - START`);
+            stream.once('close', () => {
+                if (stream.bytesRead === entry.size)
+                    this._log('UPLOAD', `${detail} - COMPLETE - ${Date.now() - started}ms`);
+            });
+            return response.stream(stream, entry.size);
         }));
 
         this.#server.put(`${PROTOCOL_PATH}/content`, this._route(async (request, response, hosted) => {
@@ -390,9 +404,14 @@ export default class Server extends EventEmitter {
                     current.size === entry.size &&
                     current.sha256 === entry.sha256
                 ) return (await hosted.manager.apply_metadata(uri, entry)).entry;
-                return (await hosted.manager.apply_file(uri, entry.size ? request : '', entry, {
+                const started = Date.now();
+                const detail = `${request.ip} - '${hosted.name}' - ${uri} - FILE - ${entry.size} BYTES`;
+                this._log('DOWNLOAD', `${detail} - START`);
+                const applied = await hosted.manager.apply_file(uri, entry.size ? request : '', entry, {
                     validate_before_commit: validate,
-                })).entry;
+                });
+                this._log('DOWNLOAD', `${detail} - COMPLETE - ${Date.now() - started}ms`);
+                return applied.entry;
             });
             return result.conflict
                 ? this._conflict(response, result.record)
@@ -520,7 +539,7 @@ export default class Server extends EventEmitter {
         map.on('error', (error) => this.emit('error', error));
         map.on('log', (code, message) => this._log(code, `'${name}' - ${message}`));
         map.on('file_size_limit', (uri, record) =>
-            this._log('SIZE_LIMIT_REACHED', `${uri} - SIZE_${record.stats.size}_BYTES`)
+            this._log('SIZE_LIMIT_REACHED', `'${name}' - ${uri} - SIZE_${record.stats.size}_BYTES`)
         );
         await map.ready();
         const hosted = { path: root, map, manager };

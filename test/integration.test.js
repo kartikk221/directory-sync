@@ -44,10 +44,12 @@ async function create_server(t, root, options = {}) {
     const port = options.port || await available_port();
     const server = new Server({ port, auth: 'secret', ...options });
     const errors = capture_errors(server);
+    const logs = [];
+    server.on('log', (code, message) => logs.push([code, message]));
     t.after(() => server.destroy());
     await server.ready();
     await server.host('repository', root, { watcher: WATCHER });
-    return { errors, port, server };
+    return { errors, logs, port, server };
 }
 
 async function create_mirror(t, root, port) {
@@ -71,7 +73,7 @@ test('HyperExpress v7 routes enforce auth/protocol and stream exact file content
     const root = await temporary_directory(t);
     const modified_at = Date.now() - 5_000;
     await write_file(root, '/nested/data.bin', Buffer.from([0, 1, 2, 3]), modified_at);
-    const { errors, port, server } = await create_server(t, root);
+    const { errors, logs, port, server } = await create_server(t, root);
 
     assert.equal(typeof server.host, 'function');
     assert.equal(typeof server.destroy, 'function');
@@ -94,6 +96,7 @@ test('HyperExpress v7 routes enforce auth/protocol and stream exact file content
     assert.equal(response.status, 200);
     const manifest = await response.json();
     assert.equal(manifest.protocol, PROTOCOL_VERSION);
+    assert.deepEqual(manifest.filters, { keep: {}, ignore: {} });
     assert.equal(typeof manifest.epoch, 'string');
     assert.equal(Number.isSafeInteger(manifest.server_time), true);
     assert.deepEqual(manifest.tombstones, []);
@@ -107,6 +110,40 @@ test('HyperExpress v7 routes enforce auth/protocol and stream exact file content
     assert.equal(response.headers.get('content-length'), '4');
     assert.equal(response.headers.get(MODIFIED_HEADER), String(modified_at));
     assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from([0, 1, 2, 3]));
+
+    const uploaded = Buffer.from([4, 5, 6]);
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/content`, 'repository', '/uploaded.bin'), {
+        method: 'PUT',
+        headers: {
+            ...headers(),
+            [MODIFIED_HEADER]: String(modified_at + 1_000),
+            [HASH_HEADER]: sha256(uploaded),
+            'content-length': String(uploaded.length),
+        },
+        body: uploaded,
+    });
+    assert.equal(response.status, 200);
+    await response.json();
+    await wait_for(() => logs.some(([code, message]) =>
+        code === 'UPLOAD' &&
+        message.includes("'repository' - /nested/data.bin - FILE - 4 BYTES - COMPLETE - ")
+    ));
+    assert.equal(logs.some(([code, message]) =>
+        code === 'UPLOAD' &&
+        message.includes("'repository' - /nested/data.bin - FILE - 4 BYTES - START")
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'DOWNLOAD' &&
+        message.includes("'repository' - /uploaded.bin - FILE - 3 BYTES - START")
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'DOWNLOAD' &&
+        message.includes("'repository' - /uploaded.bin - FILE - 3 BYTES - COMPLETE - ")
+    ), true);
+    assert.equal(logs.some(([code]) => code === 'MANIFEST'), true);
+    assert.equal(logs.every(([code]) =>
+        ['UPLOAD', 'DOWNLOAD', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
+    ), true);
     assert.deepEqual(errors, []);
 });
 
@@ -208,6 +245,9 @@ test('a Server restart creates a new epoch and Mirrors converge new mutations', 
         mirror_errors: mirror.errors.map((error) => error.message),
         replacement_errors: replacement_errors.map((error) => error.message),
     }) });
+    assert.equal(mirror.logs.some(([code, message]) =>
+        code === 'WEBSOCKET' && message.startsWith('DISCONNECTED - ')
+    ), true);
     assert.deepEqual(mirror.errors, []);
     assert.deepEqual(replacement_errors, []);
 });
@@ -277,7 +317,7 @@ test('server rejects malformed, oversized, stale, and filtered mutations', async
     assert.deepEqual(errors, []);
 });
 
-test('Mirror skips authority-filtered paths without aborting transfers or logs', async (t) => {
+test('Mirror drops authority-filtered paths before transfers or logs', async (t) => {
     const server_root = await temporary_directory(t, 'directory-sync-filter-server-');
     const mirror_root = await temporary_directory(t, 'directory-sync-filter-mirror-');
     await write_file(server_root, '/download.txt', 'download');
@@ -293,7 +333,7 @@ test('Mirror skips authority-filtered paths without aborting transfers or logs',
         filters: { ignore: { directories: ['blocked'] } },
     });
 
-    const { errors, logs } = await create_mirror(t, mirror_root, port);
+    const { errors, logs, mirror } = await create_mirror(t, mirror_root, port);
     assert.equal(await read_if_exists(Path.join(server_root, 'allowed.txt')), 'allowed');
     assert.equal(await read_if_exists(Path.join(mirror_root, 'download.txt')), 'download');
     assert.equal(await read_if_exists(Path.join(server_root, 'blocked/rejected.txt')), undefined);
@@ -310,7 +350,15 @@ test('Mirror skips authority-filtered paths without aborting transfers or logs',
         code === 'DOWNLOAD' && message.startsWith('/download.txt - FILE - COMPLETE - ')
     ), true);
     assert.equal(logs.some(([code, message]) =>
-        code === 'FILTERED' && message.startsWith('/blocked')
+        code === 'FILTERED' || message.startsWith('/blocked')
+    ), false);
+    await write_file(mirror_root, '/nested/blocked/live.txt', 'blocked');
+    await wait(200);
+    assert.equal(mirror.map.get_entry('/nested/blocked/live.txt'), undefined);
+    assert.equal(await read_if_exists(Path.join(server_root, 'nested/blocked/live.txt')), undefined);
+    assert.equal(logs.some(([, message]) => message.includes('/nested/blocked/live.txt')), false);
+    assert.equal(logs.every(([code]) =>
+        ['UPLOAD', 'DOWNLOAD', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
     ), true);
     assert.deepEqual(errors, []);
     assert.deepEqual(server_errors, []);
