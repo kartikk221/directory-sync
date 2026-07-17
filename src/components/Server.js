@@ -410,6 +410,11 @@ export default class Server extends EventEmitter {
                 const applied = await hosted.manager.apply_file(uri, entry.size ? request : '', entry, {
                     validate_before_commit: validate,
                 });
+                if (current?.type !== 'file') {
+                    if (current?.type === 'directory')
+                        this._log('DELETE', `${request.ip} - '${hosted.name}' - ${uri} - DIRECTORY - ${Date.now() - started}ms`);
+                    this._log('CREATE', `${request.ip} - '${hosted.name}' - ${uri} - FILE - ${Date.now() - started}ms`);
+                }
                 this._log('DOWNLOAD', `${detail} - COMPLETE - ${Date.now() - started}ms`);
                 return applied.entry;
             });
@@ -440,9 +445,16 @@ export default class Server extends EventEmitter {
             const entry = await request.json();
             validate_entry(entry);
             if (entry.type !== 'directory') throw new TypeError('Expected a directory entry.');
-            const result = await this._mutate(hosted, uri, entry, request, async () =>
-                (await hosted.manager.apply_directory(uri, entry)).entry
-            );
+            const result = await this._mutate(hosted, uri, entry, request, async (validate, current) => {
+                const started = Date.now();
+                const applied = await hosted.manager.apply_directory(uri, entry);
+                if (current?.type !== 'directory') {
+                    if (current?.type === 'file')
+                        this._log('DELETE', `${request.ip} - '${hosted.name}' - ${uri} - FILE - ${Date.now() - started}ms`);
+                    this._log('CREATE', `${request.ip} - '${hosted.name}' - ${uri} - DIRECTORY - ${Date.now() - started}ms`);
+                }
+                return applied.entry;
+            });
             return result.conflict
                 ? this._conflict(response, result.record)
                 : this._success(response, result.record);
@@ -456,9 +468,19 @@ export default class Server extends EventEmitter {
             if (entry.type !== 'tombstone') throw new TypeError('Expected a tombstone entry.');
             if (!hosted.map.allows(uri, entry.target))
                 return response.status(422).json({ code: 'FILTERED', message: 'The authority filters this entry.' });
-            const result = await this._mutate(hosted, uri, entry, request, () =>
-                hosted.manager.apply_tombstone(uri, entry)
-            );
+            const result = await this._mutate(hosted, uri, entry, request, async () => {
+                const started = Date.now();
+                const before = entry.target === 'directory'
+                    ? Object.keys(hosted.map.active_entries_under(uri)).length
+                    : Number(hosted.map.canonical_entry(uri)?.type === 'file');
+                const applied = await hosted.manager.apply_tombstone(uri, entry);
+                const after = entry.target === 'directory'
+                    ? Object.keys(hosted.map.active_entries_under(uri)).length
+                    : Number(hosted.map.canonical_entry(uri)?.type === 'file');
+                if (after < before)
+                    this._log('DELETE', `${request.ip} - '${hosted.name}' - ${uri} - ${entry.target.toUpperCase()} - ${Date.now() - started}ms`);
+                return applied;
+            });
             return result.conflict
                 ? this._conflict(response, result.record)
                 : this._success(response, result.record);
@@ -549,7 +571,14 @@ export default class Server extends EventEmitter {
             work: new KeyedQueue(),
         };
         const internal = { name, ...hosted, authority };
-        map.on('mutation', (uri, entry) => {
+        map.on('mutation', (uri, entry, previous) => {
+            if (entry.type === 'tombstone')
+                this._log('DELETE', `'${name}' - ${uri} - ${entry.target.toUpperCase()}`);
+            else if (previous?.type !== entry.type) {
+                if (previous && previous.type !== 'tombstone')
+                    this._log('DELETE', `'${name}' - ${uri} - ${previous.type.toUpperCase()}`);
+                this._log('CREATE', `'${name}' - ${uri} - ${entry.type.toUpperCase()}`);
+            }
             const record = this._record_mutation(internal, uri, entry);
             this._publish_mutation(name, record, 'server');
         });

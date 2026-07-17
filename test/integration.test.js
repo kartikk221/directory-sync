@@ -140,9 +140,13 @@ test('HyperExpress v7 routes enforce auth/protocol and stream exact file content
         code === 'DOWNLOAD' &&
         message.includes("'repository' - /uploaded.bin - FILE - 3 BYTES - COMPLETE - ")
     ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'CREATE' &&
+        /'repository' - \/uploaded\.bin - FILE - \d+ms$/.test(message)
+    ), true);
     assert.equal(logs.some(([code]) => code === 'MANIFEST'), true);
     assert.equal(logs.every(([code]) =>
-        ['UPLOAD', 'DOWNLOAD', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
+        ['UPLOAD', 'DOWNLOAD', 'CREATE', 'DELETE', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
     ), true);
     assert.deepEqual(errors, []);
 });
@@ -350,6 +354,12 @@ test('Mirror drops authority-filtered paths before transfers or logs', async (t)
         code === 'DOWNLOAD' && message.startsWith('/download.txt - FILE - COMPLETE - ')
     ), true);
     assert.equal(logs.some(([code, message]) =>
+        code === 'MANIFEST' && /^repository - SYNC COMPLETE - \d+ms$/.test(message)
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'CREATE' && /^\/download\.txt - FILE - \d+ms$/.test(message)
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
         code === 'FILTERED' || message.startsWith('/blocked')
     ), false);
     await write_file(mirror_root, '/nested/blocked/live.txt', 'blocked');
@@ -358,7 +368,7 @@ test('Mirror drops authority-filtered paths before transfers or logs', async (t)
     assert.equal(await read_if_exists(Path.join(server_root, 'nested/blocked/live.txt')), undefined);
     assert.equal(logs.some(([, message]) => message.includes('/nested/blocked/live.txt')), false);
     assert.equal(logs.every(([code]) =>
-        ['UPLOAD', 'DOWNLOAD', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
+        ['UPLOAD', 'DOWNLOAD', 'CREATE', 'DELETE', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
     ), true);
     assert.deepEqual(errors, []);
     assert.deepEqual(server_errors, []);
@@ -452,6 +462,15 @@ test('server authority converges two mirrors with newest-mtime conflict resoluti
         second_errors: second_record.errors.map((error) => error.message),
     }) });
     assert.equal(server_record.server.hosts.repository.map.manifest['/shared.txt'], undefined);
+    assert.equal(first_record.logs.some(([code, message]) =>
+        code === 'DELETE' && /^\/shared\.txt - FILE - \d+ms$/.test(message)
+    ), true);
+    assert.equal(server_record.logs.some(([code, message]) =>
+        code === 'DELETE' && /'repository' - \/shared\.txt - FILE - \d+ms$/.test(message)
+    ), true);
+    assert.equal(second_record.logs.some(([code, message]) =>
+        code === 'DELETE' && /^\/shared\.txt - FILE - \d+ms$/.test(message)
+    ), true);
 
     const deletion = server_record.server.hosts.repository.map.get_tombstone('/shared.txt');
     assert.equal(deletion.type, 'tombstone');
@@ -541,6 +560,55 @@ test('zero-byte files and directory/file transitions converge across mirrors', a
         server_errors: server_record.errors.map((error) => error.message),
         mirror_errors: mirror_record.errors.map((error) => error.message),
     }) });
+    assert.deepEqual(server_record.errors, []);
+    assert.deepEqual(mirror_record.errors, []);
+});
+
+test('recursive directory deletion emits one parent DELETE log per destination', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-delete-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-delete-mirror-');
+    await write_file(server_root, '/tree/nested/child.txt', 'child');
+    const server_record = await create_server(t, server_root);
+    const mirror_record = await create_mirror(t, mirror_root, server_record.port);
+    await wait_for(async () =>
+        (await read_if_exists(Path.join(mirror_root, 'tree/nested/child.txt'))) === 'child'
+    );
+    const server_log_index = server_record.logs.length;
+    const mirror_log_index = mirror_record.logs.length;
+
+    const response = await fetch(
+        endpoint(server_record.port, `${PROTOCOL_PATH}/entry`, 'repository', '/tree'),
+        {
+            method: 'DELETE',
+            headers: { ...headers(), 'content-type': 'application/json' },
+            body: JSON.stringify({
+                type: 'tombstone',
+                target: 'directory',
+                deleted_at: Date.now() + 1_000,
+                include_self: true,
+            }),
+        }
+    );
+    assert.equal(response.status, 200);
+    await response.json();
+    await wait_for(async () =>
+        (await read_if_exists(Path.join(mirror_root, 'tree'))) === undefined
+    );
+
+    const server_logs = server_record.logs.slice(server_log_index);
+    const mirror_logs = mirror_record.logs.slice(mirror_log_index);
+    assert.equal(server_logs.some(([code, message]) =>
+        code === 'DELETE' && /'repository' - \/tree - DIRECTORY - \d+ms$/.test(message)
+    ), true);
+    assert.equal(mirror_logs.some(([code, message]) =>
+        code === 'DELETE' && /^\/tree - DIRECTORY - \d+ms$/.test(message)
+    ), true);
+    assert.equal(server_logs.some(([code, message]) =>
+        code === 'DELETE' && message.includes('/tree/')
+    ), false);
+    assert.equal(mirror_logs.some(([code, message]) =>
+        code === 'DELETE' && message.includes('/tree/')
+    ), false);
     assert.deepEqual(server_record.errors, []);
     assert.deepEqual(mirror_record.errors, []);
 });

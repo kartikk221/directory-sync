@@ -350,7 +350,7 @@ export default class Mirror extends EventEmitter {
         const remote = await this.#initial_remote_promise;
         await this._perform_hard_sync(remote);
         await this.#map.settled();
-        this.#map.on('mutation', (uri, entry) => this._handle_local_mutation(uri, entry));
+        this.#map.on('mutation', (uri, entry, previous) => this._handle_local_mutation(uri, entry, previous));
         this.#initialized = true;
         for (const message of this.#pending_mutations.splice(0)) this._receive_mutation(message);
         return this;
@@ -506,18 +506,31 @@ export default class Mirror extends EventEmitter {
             return;
         }
         if (entry.type === 'directory') {
+            const started = Date.now();
             await this.#manager.apply_directory(uri, localized);
             this._adopt_revision(uri, entry, revision, epoch);
+            if (local?.type !== 'directory') {
+                if (local?.type === 'file')
+                    this._log('DELETE', `${uri} - FILE - ${Date.now() - started}ms`);
+                this._log('CREATE', `${uri} - DIRECTORY - ${Date.now() - started}ms`);
+            }
             return;
         }
         if (entry.type === 'tombstone') {
+            const started = Date.now();
+            const before = entry.target === 'directory'
+                ? Object.keys(this.#map.active_entries_under(uri)).length
+                : Number(local?.type === 'file');
             await this.#manager.apply_tombstone(uri, localized);
             this._adopt_revision(uri, entry, revision, epoch);
+            const after = entry.target === 'directory'
+                ? Object.keys(this.#map.active_entries_under(uri)).length
+                : Number(this.#map.canonical_entry(uri)?.type === 'file');
+            if (after < before)
+                this._log('DELETE', `${uri} - ${entry.target.toUpperCase()} - ${Date.now() - started}ms`);
             return;
         }
 
-        const start = Date.now();
-        this._log('DOWNLOAD', `${uri} - FILE - START`);
         const response = await this._request('GET', `${PROTOCOL_PATH}/content`, { uri });
         if (response.status === 404) return;
         const actual_epoch = response.headers.get(EPOCH_HEADER);
@@ -537,6 +550,8 @@ export default class Mirror extends EventEmitter {
             this._perform_hard_sync().catch((error) => this._emit_error(error));
             return;
         }
+        const start = Date.now();
+        this._log('DOWNLOAD', `${uri} - FILE - START`);
         const actual_local = this._localize_remote(actual);
         await this.#manager.apply_file(uri, response.body, actual_local, {
             validate_before_commit: () => {
@@ -545,10 +560,15 @@ export default class Mirror extends EventEmitter {
             },
         });
         this._adopt_revision(uri, actual, actual_revision, actual_epoch);
+        if (local?.type !== 'file') {
+            if (local?.type === 'directory')
+                this._log('DELETE', `${uri} - DIRECTORY - ${Date.now() - start}ms`);
+            this._log('CREATE', `${uri} - FILE - ${Date.now() - start}ms`);
+        }
         this._log('DOWNLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start}ms`);
     }
 
-    async _push_local(uri, entry, remote) {
+    async _push_local(uri, entry, remote, previous = remote?.entry) {
         if (!entry) return;
         validate_entry(entry);
         const type = entry.type === 'tombstone' ? entry.target : entry.type;
@@ -568,6 +588,7 @@ export default class Mirror extends EventEmitter {
         const wire_entry = this._normalize_local(entry);
         const remote_entry = remote?.entry;
         const headers = this._revision_headers(uri, remote?.revision);
+        const mutation_started = Date.now();
         let response;
         if (entry.type === 'directory') {
             response = await this._request('PUT', `${PROTOCOL_PATH}/directory`, {
@@ -621,7 +642,17 @@ export default class Mirror extends EventEmitter {
         }
         if (payload.entry && !entries_equivalent(payload.entry, wire_entry))
             await this._apply_remote(uri, payload.entry, payload.revision, payload.epoch);
-        else this._adopt_revision(uri, payload.entry, payload.revision, payload.epoch);
+        else {
+            this._adopt_revision(uri, payload.entry, payload.revision, payload.epoch);
+            if (entry.type === 'tombstone') {
+                if (previous && previous.type !== 'tombstone')
+                    this._log('DELETE', `${uri} - ${entry.target.toUpperCase()} - ${Date.now() - mutation_started}ms`);
+            } else if (previous?.type !== entry.type) {
+                if (previous && previous.type !== 'tombstone')
+                    this._log('DELETE', `${uri} - ${previous.type.toUpperCase()} - ${Date.now() - mutation_started}ms`);
+                this._log('CREATE', `${uri} - ${entry.type.toUpperCase()} - ${Date.now() - mutation_started}ms`);
+            }
+        }
     }
 
     async _plan(remote, local) {
@@ -792,21 +823,23 @@ export default class Mirror extends EventEmitter {
             return this.#reconcile_promise;
         }
         this.#reconcile_promise = (async () => {
+            const started = Date.now();
             await this._reconcile_once(state);
             while (this.#reconcile_again && !this.#destroyed) {
                 this.#reconcile_again = false;
                 await this._reconcile_once();
             }
+            this._log('MANIFEST', `${this.#host} - SYNC COMPLETE - ${Date.now() - started}ms`);
         })().finally(() => {
             this.#reconcile_promise = undefined;
         });
         return this.#reconcile_promise;
     }
 
-    _handle_local_mutation(uri, entry) {
+    _handle_local_mutation(uri, entry, previous) {
         const type = entry.type === 'tombstone' ? entry.target : entry.type;
         if (!this.#authority_allows(uri, type)) return;
-        this._schedule(uri, () => this._push_local(uri, entry))
+        this._schedule(uri, () => this._push_local(uri, entry, undefined, previous))
             .catch((error) => {
                 if (error.code === 'FILTERED') return;
                 if (!this.#destroyed) this._emit_error(error);
