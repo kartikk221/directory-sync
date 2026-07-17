@@ -1,6 +1,7 @@
 import Crypto, { randomUUID } from 'node:crypto';
 import FileSystemSync from 'node:fs';
 import FileSystem from 'node:fs/promises';
+import OS from 'node:os';
 import Path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -17,6 +18,13 @@ function operation_error(code, message) {
     return error;
 }
 
+function uri_depth(uri) {
+    let depth = 0;
+    for (let index = 0; index < uri.length; index++)
+        if (uri.charCodeAt(index) === 47) depth++;
+    return depth;
+}
+
 function as_readable(data) {
     if (data == null) return Readable.from([]);
     if (data instanceof Readable || typeof data?.pipe === 'function') return data;
@@ -27,11 +35,30 @@ function as_readable(data) {
     throw new TypeError('File content must be a string, Buffer, Node stream, or Web stream.');
 }
 
+let temporary_directory_promise;
+
+function system_temporary_directory() {
+    if (!temporary_directory_promise) {
+        temporary_directory_promise = (async () => {
+            try {
+                const path = OS.tmpdir();
+                if (typeof path !== 'string' || !path)
+                    throw new Error('OS temporary directory is unavailable.');
+                await FileSystem.access(path, FileSystemSync.constants.W_OK);
+                return path;
+            } catch {
+                return undefined;
+            }
+        })();
+    }
+    return temporary_directory_promise;
+}
+
 /**
  * Applies validated repository mutations to a DirectoryMap's filesystem.
  *
- * File writes stream through a SHA-256/size verifier into the state directory,
- * set the requested mtime, and atomically rename only after validation succeeds.
+ * File writes stream through a SHA-256/size verifier into the OS temporary
+ * directory and replace the destination only after validation succeeds.
  * Per-URI serialization in DirectoryMap prevents overlapping commits.
  */
 export default class DirectoryManager {
@@ -58,7 +85,8 @@ export default class DirectoryManager {
         if (relative.startsWith('..') || Path.isAbsolute(relative))
             throw operation_error('INVALID_URI', 'Path escapes the synchronized root.');
         let cursor = root;
-        for (const segment of relative.split(Path.sep).filter(Boolean)) {
+        for (const segment of relative.split(Path.sep)) {
+            if (!segment) continue;
             cursor = Path.join(cursor, segment);
             try {
                 const stats = await FileSystem.lstat(cursor);
@@ -95,6 +123,42 @@ export default class DirectoryManager {
         }
     }
 
+    async _temporary_path(destination, suffix = '.part') {
+        const temporary = await system_temporary_directory();
+        return temporary
+            ? Path.join(temporary, `${randomUUID()}${suffix}`)
+            : Path.join(Path.dirname(destination), `.${randomUUID()}${suffix}`);
+    }
+
+    async _rename_overwrite(source, destination) {
+        try {
+            await FileSystem.rename(source, destination);
+        } catch (error) {
+            if (!['EEXIST', 'EPERM'].includes(error.code)) throw error;
+            await FileSystem.rm(destination, { recursive: true, force: true });
+            await FileSystem.rename(source, destination);
+        }
+    }
+
+    async _commit_temporary(temporary, destination, modified_at) {
+        try {
+            await this._rename_overwrite(temporary, destination);
+            return;
+        } catch (error) {
+            if (error.code !== 'EXDEV') throw error;
+        }
+
+        const sibling = Path.join(Path.dirname(destination), `.${randomUUID()}.part`);
+        try {
+            await FileSystem.copyFile(temporary, sibling, FileSystemSync.constants.COPYFILE_EXCL);
+            const seconds = modified_at / 1_000;
+            await FileSystem.utimes(sibling, seconds, seconds);
+            await this._rename_overwrite(sibling, destination);
+        } finally {
+            await FileSystem.rm(sibling, { force: true }).catch(() => undefined);
+        }
+    }
+
     /**
      * Reads an active file.
      *
@@ -127,7 +191,7 @@ export default class DirectoryManager {
         return this.#map.run_serial(canonical, async () => {
             const path = this._absolute_path(canonical);
             await this._assert_safe_parent(path);
-            const temporary = Path.join(this.#map.state.tmp_path, `${randomUUID()}.part`);
+            const temporary = await this._temporary_path(path);
             const hash = Crypto.createHash('sha256');
             let size = 0;
             const verifier = new Transform({
@@ -141,8 +205,8 @@ export default class DirectoryManager {
             });
 
             try {
-                // Never expose partial bytes at the repository path. The temporary
-                // file lives on the same state filesystem so rename is atomic.
+                // Never expose partial bytes at the repository path. Cross-device
+                // moves stage one verified sibling before the final atomic rename.
                 await pipeline(
                     as_readable(data),
                     verifier,
@@ -161,15 +225,13 @@ export default class DirectoryManager {
                 await FileSystem.utimes(temporary, seconds, seconds);
                 await this._remove_type_conflict(path, 'file');
                 if (this.#supress_mutations || options.supress) this.#map.expect(canonical, entry);
-                try {
-                    await FileSystem.rename(temporary, path);
-                } catch (error) {
-                    if (!['EEXIST', 'EPERM'].includes(error.code)) throw error;
-                    await FileSystem.rm(path, { recursive: true, force: true });
-                    await FileSystem.rename(temporary, path);
-                }
+                await this.#map.observe(path, () =>
+                    this._commit_temporary(temporary, path, entry.modified_at)
+                );
                 const stats = await FileSystem.lstat(path);
-                return this.#map.commit_entry(canonical, entry, stats);
+                const committed = { ...entry, modified_at: Math.round(stats.mtimeMs) };
+                if (this.#supress_mutations || options.supress) this.#map.expect(canonical, committed);
+                return this.#map.commit_entry(canonical, committed, stats);
             } finally {
                 await FileSystem.rm(temporary, { force: true }).catch(() => undefined);
             }
@@ -199,7 +261,12 @@ export default class DirectoryManager {
             if (this.#supress_mutations) this.#map.expect(canonical, entry);
             await FileSystem.utimes(path, seconds, seconds);
             const stats = await FileSystem.lstat(path);
-            return this.#map.commit_entry(canonical, entry, stats);
+            const committed = {
+                ...entry,
+                modified_at: Math.round(stats.mtimeMs),
+            };
+            if (this.#supress_mutations) this.#map.expect(canonical, committed);
+            return this.#map.commit_entry(canonical, committed, stats);
         });
     }
 
@@ -223,7 +290,12 @@ export default class DirectoryManager {
             const seconds = entry.modified_at / 1_000;
             await FileSystem.utimes(path, seconds, seconds);
             const stats = await FileSystem.lstat(path);
-            return this.#map.commit_entry(canonical, entry, stats);
+            const committed = {
+                ...entry,
+                modified_at: Math.round(stats.mtimeMs),
+            };
+            if (this.#supress_mutations) this.#map.expect(canonical, committed);
+            return this.#map.commit_entry(canonical, committed, stats);
         });
     }
 
@@ -246,19 +318,37 @@ export default class DirectoryManager {
                 if (entry.target === 'directory') {
                     const active = this.#map.active_entries_under(canonical);
                     const preserve_self = entry.include_self === false;
-                    const protected_uris = Object.entries(active)
-                        .filter(([candidate, current]) => candidate !== canonical && compare_entries(current, entry) < 0)
-                        .map(([candidate]) => candidate);
-                    const removable = Object.entries(active)
-                        .filter(([candidate, current]) => {
-                            if ((preserve_self && candidate === canonical) || compare_entries(current, entry) < 0)
-                                return false;
-                            return !protected_uris.some((protected_uri) =>
-                                protected_uri.startsWith(`${candidate}/`)
-                            );
-                        })
-                        .map(([candidate]) => candidate)
-                        .sort((left, right) => right.split('/').length - left.split('/').length);
+                    const entries = Object.entries(active);
+                    const protected_uris = [];
+                    const protected_ancestors = new Set();
+                    let iterations = 0;
+                    for (const [candidate, current] of entries) {
+                        if (candidate !== canonical && compare_entries(entry, current) === 1) {
+                            protected_uris.push(candidate);
+                            let parent = Path.posix.dirname(candidate);
+                            while (parent && parent !== '/') {
+                                protected_ancestors.add(parent);
+                                if (parent === canonical) break;
+                                const next = Path.posix.dirname(parent);
+                                if (next === parent) break;
+                                parent = next;
+                            }
+                        }
+                        if (++iterations % 2_048 === 0)
+                            await new Promise((resolve) => setImmediate(resolve));
+                    }
+                    const removable = [];
+                    iterations = 0;
+                    for (const [candidate, current] of entries) {
+                        if (++iterations % 2_048 === 0)
+                            await new Promise((resolve) => setImmediate(resolve));
+                        if (
+                            (preserve_self && candidate === canonical) ||
+                            compare_entries(entry, current) === 1
+                        ) continue;
+                        if (!protected_ancestors.has(candidate)) removable.push(candidate);
+                    }
+                    removable.sort((left, right) => uri_depth(right) - uri_depth(left));
                     if (preserve_self || protected_uris.length) {
                         applied = { ...entry, include_self: false };
                         for (const candidate of removable)
@@ -306,7 +396,7 @@ export default class DirectoryManager {
             buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
         else if (data instanceof ArrayBuffer) buffer = Buffer.from(data);
         if (!buffer && (data instanceof Readable || typeof data?.pipe === 'function')) {
-            const temporary = Path.join(this.#map.state.tmp_path, `${randomUUID()}.legacy.part`);
+            const temporary = await this._temporary_path(this._absolute_path(uri), '.legacy.part');
             const digest = Crypto.createHash('sha256');
             const legacy = sha256?.length === 32 ? Crypto.createHash('md5') : undefined;
             let size = 0;
@@ -353,7 +443,7 @@ export default class DirectoryManager {
     }
 
     /**
-     * Backward-compatible buffered indirect write. Protocol-v3 streams must use apply_file() with full metadata.
+     * Backward-compatible buffered indirect write. Protocol streams use apply_file() with full metadata.
      *
      * @param {string} uri Repository URI.
      * @param {string|Buffer|import('node:stream').Readable} data Buffered or streamed file content.
@@ -382,7 +472,7 @@ export default class DirectoryManager {
     }
 
     /**
-     * Deletes an active entry and records a durable tombstone.
+     * Deletes an active entry and records an in-memory tombstone when enabled.
      *
      * @param {string} uri Repository URI.
      * @param {boolean} [is_directory] Optional v2 type hint; current metadata is used when omitted.

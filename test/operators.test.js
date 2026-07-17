@@ -43,11 +43,12 @@ test('merge_options deeply preserves defaults and caller-owned values', () => {
     assert.throws(() => merge_options([], {}), TypeError);
 });
 
-test('canonical URIs reject traversal, reserved state, and ambiguous paths', () => {
+test('canonical URIs reject traversal and ambiguous paths without reserving user names', () => {
     assert.equal(canonicalize_uri('nested/file.txt'), '/nested/file.txt');
     assert.equal(canonicalize_uri('//nested///file.txt/'), '/nested/file.txt');
-    for (const uri of ['/', '/../secret', '/a/./b', '/a\\b', '/.directory-sync/state', '/a\0b'])
+    for (const uri of ['/', '/../secret', '/a/./b', '/a\\b', '/a\0b'])
         assert.throws(() => canonicalize_uri(uri));
+    assert.equal(canonicalize_uri('/.directory-sync/state'), '/.directory-sync/state');
     assert.equal(canonicalize_uri('/', { allow_root: true }), '/');
 });
 

@@ -3,8 +3,6 @@ import FileSystem from 'node:fs';
 import AsyncFileSystem from 'node:fs/promises';
 import Path from 'node:path';
 
-const RESERVED_DIRECTORY = '.directory-sync';
-
 /** @param {unknown} value @returns {boolean} Whether value has a plain or null prototype. */
 function is_plain_object(value) {
     if (value === null || typeof value !== 'object') return false;
@@ -112,10 +110,10 @@ function to_path_uri(value) {
  * Validates and canonicalizes an untrusted repository URI.
  *
  * @param {string} value Candidate URI.
- * @param {{allow_root?: boolean, allow_reserved?: boolean}} [options] Validation exceptions for internal callers.
+ * @param {{allow_root?: boolean}} [options] Validation exceptions for internal callers.
  * @returns {string}
  */
-function canonicalize_uri(value, { allow_root = false, allow_reserved = false } = {}) {
+function canonicalize_uri(value, { allow_root = false } = {}) {
     if (typeof value !== 'string') throw new TypeError('URI must be a string.');
     if (value.includes('\0')) throw new Error('URI must not contain NUL bytes.');
     if (value.includes('\\')) throw new Error('URI must use forward slashes.');
@@ -125,8 +123,6 @@ function canonicalize_uri(value, { allow_root = false, allow_reserved = false } 
     if (segments.some((segment) => segment === '.' || segment === '..'))
         throw new Error('URI must not contain relative path segments.');
     if (!allow_root && uri === '/') throw new Error('The synchronized root is not a valid entry URI.');
-    if (!allow_reserved && segments[0] === RESERVED_DIRECTORY)
-        throw new Error(`The reserved '${RESERVED_DIRECTORY}' directory cannot be synchronized.`);
     return uri;
 }
 
@@ -135,7 +131,7 @@ function canonicalize_uri(value, { allow_root = false, allow_reserved = false } 
  *
  * @param {string} root Absolute synchronized root.
  * @param {string} uri Repository URI.
- * @param {{allow_root?: boolean, allow_reserved?: boolean}} [options] Canonicalization options.
+ * @param {{allow_root?: boolean}} [options] Canonicalization options.
  * @returns {string}
  */
 function resolve_uri(root, uri, options) {
@@ -170,7 +166,7 @@ function generate_sha256_hash(path) {
     });
 }
 
-/** Compatibility alias. V3 wire data always uses SHA-256 despite the legacy name. */
+/** Compatibility alias. Protocol v5 uses SHA-256 despite the legacy name. */
 const generate_md5_hash = generate_sha256_hash;
 
 /** @template T @param {string} value @param {T} [fallback] @returns {unknown|T} */
@@ -280,7 +276,6 @@ function hex_to_ascii(string) {
 }
 
 export {
-    RESERVED_DIRECTORY,
     abort_error,
     ascii_to_hex,
     async_wait,

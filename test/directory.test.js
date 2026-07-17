@@ -20,11 +20,12 @@ async function create_map(t, root, options = {}) {
     return { errors, manager: new DirectoryManager(map, true), map };
 }
 
-test('DirectoryMap indexes files, directories, filters, and reserved state', async (t) => {
+test('DirectoryMap indexes files, directories, filters, and user-owned hidden paths', async (t) => {
     const root = await temporary_directory(t);
     await write_file(root, '/keep/data.txt', 'kept');
     await write_file(root, '/keep/data.bin', 'ignored');
     await write_file(root, '/ignored/data.txt', 'ignored');
+    await write_file(root, '/.directory-sync/user.txt', 'user-owned');
     const { map } = await create_map(t, root, {
         filters: {
             keep: { extensions: ['.txt'] },
@@ -35,7 +36,7 @@ test('DirectoryMap indexes files, directories, filters, and reserved state', asy
     assert.equal(map.get('/keep/data.txt').stats.sha256, sha256('kept'));
     assert.equal(map.get('/keep/data.bin'), undefined);
     assert.equal(map.get('/ignored/data.txt'), undefined);
-    assert.throws(() => map.get('/.directory-sync'), /reserved/);
+    assert.equal(map.get('/.directory-sync/user.txt').stats.sha256, sha256('user-owned'));
     assert.equal(map.schema['/keep/data.txt'][0], sha256('kept'));
 });
 
@@ -115,25 +116,29 @@ test('non-self directory tombstones preserve the directory and newer descendants
     assert.equal((await FileSystem.lstat(Path.join(root, 'tree'))).isDirectory(), true);
     await assert.rejects(FileSystem.access(Path.join(root, 'tree/stale.txt')), { code: 'ENOENT' });
     assert.equal(await FileSystem.readFile(Path.join(root, 'tree/new.txt'), 'utf8'), 'new');
-    assert.equal(map.manifest['/tree'].type, 'tombstone');
-    assert.equal(map.manifest['/tree'].include_self, false);
+    assert.equal(map.manifest['/tree'].type, 'directory');
+    assert.equal(map.get_tombstone('/tree').include_self, false);
     assert.equal(map.canonical_entry('/tree').type, 'directory');
 });
 
-test('DirectoryMap recovers deletions made while the process was stopped', async (t) => {
+test('DirectoryMap rebuilds from disk without persisting private state', async (t) => {
     const root = await temporary_directory(t);
+    const ignored_state = Path.join(root, 'obsolete-state');
     await write_file(root, '/offline.txt', 'content');
-    let map = new DirectoryMap({ path: root, watcher: WATCHER });
+    let map = new DirectoryMap({ path: root, state: { path: ignored_state }, watcher: WATCHER });
     capture_errors(map);
     await map.ready();
+    assert.equal(map.options.state.path, undefined);
     await map.destroy();
     await FileSystem.rm(Path.join(root, 'offline.txt'));
 
     map = new DirectoryMap({ path: root, watcher: WATCHER });
     const errors = capture_errors(map);
     await map.ready();
-    assert.equal(map.manifest['/offline.txt'].type, 'tombstone');
-    assert.equal(map.manifest['/offline.txt'].target, 'file');
+    assert.equal(map.manifest['/offline.txt'], undefined);
+    assert.equal(map.get_tombstone('/offline.txt'), undefined);
+    await assert.rejects(FileSystem.access(Path.join(root, '.directory-sync')), { code: 'ENOENT' });
+    await assert.rejects(FileSystem.access(ignored_state), { code: 'ENOENT' });
     assert.deepEqual(errors, []);
     await map.destroy();
 });
@@ -159,7 +164,12 @@ test('DirectoryMap preserves LTS write stability and Chokidar backend defaults',
     const polling_root = await temporary_directory(t);
     const explicit_root = await temporary_directory(t);
     await write_file(root, '/document.txt', 'initial');
-    const map = new DirectoryMap({ path: root });
+    const editor_tmp = Path.join(root, '.editor-tmp');
+    await FileSystem.mkdir(editor_tmp);
+    const map = new DirectoryMap({
+        path: root,
+        watcher: { ignored: (path) => path === editor_tmp || path.startsWith(`${editor_tmp}/`) },
+    });
     const errors = capture_errors(map);
     t.after(() => map.destroy());
     await map.ready();
@@ -173,7 +183,7 @@ test('DirectoryMap preserves LTS write stability and Chokidar backend defaults',
 
     const mutations = [];
     map.on('mutation', (uri, entry) => mutations.push({ entry, uri }));
-    const temporary = Path.join(map.state.tmp_path, 'editor-atomic-save.tmp');
+    const temporary = Path.join(editor_tmp, 'editor-atomic-save.tmp');
     await FileSystem.writeFile(temporary, 'atomically-saved');
     await FileSystem.utimes(temporary, (Date.now() + 1_000) / 1_000, (Date.now() + 1_000) / 1_000);
     await FileSystem.rename(temporary, Path.join(root, 'document.txt'));

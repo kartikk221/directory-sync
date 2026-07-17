@@ -6,9 +6,12 @@ import test from 'node:test';
 import { Mirror, Server } from '../index.js';
 import {
     AUTH_HEADER,
+    BASE_REVISION_HEADER,
+    EPOCH_HEADER,
     HASH_HEADER,
     MODIFIED_HEADER,
     PROTOCOL_HEADER,
+    PROTOCOL_PATH,
     PROTOCOL_VERSION,
 } from '../src/constants.js';
 import {
@@ -73,25 +76,29 @@ test('HyperExpress v7 routes enforce auth/protocol and stream exact file content
     assert.equal(server.options.auth, 'secret');
     assert.ok(server.hosts.repository);
 
-    let response = await fetch(endpoint(port, '/v3/manifest'), {
+    let response = await fetch(endpoint(port, `${PROTOCOL_PATH}/manifest`), {
         headers: headers('invalid'),
     });
     assert.equal(response.status, 403);
     assert.equal((await response.json()).code, 'UNAUTHORIZED');
 
-    response = await fetch(endpoint(port, '/v3/manifest'), {
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/manifest`), {
         headers: headers('secret', PROTOCOL_VERSION - 1),
     });
     assert.equal(response.status, 426);
     assert.equal(response.headers.get(PROTOCOL_HEADER), String(PROTOCOL_VERSION));
 
-    response = await fetch(endpoint(port, '/v3/manifest'), { headers: headers() });
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/manifest`), { headers: headers() });
     assert.equal(response.status, 200);
     const manifest = await response.json();
     assert.equal(manifest.protocol, PROTOCOL_VERSION);
+    assert.equal(typeof manifest.epoch, 'string');
+    assert.equal(Number.isSafeInteger(manifest.server_time), true);
+    assert.deepEqual(manifest.tombstones, []);
+    assert.equal(manifest.versions['/nested/data.bin'], 0);
     assert.equal(manifest.manifest['/nested/data.bin'].sha256, sha256(Buffer.from([0, 1, 2, 3])));
 
-    response = await fetch(endpoint(port, '/v3/content', 'repository', '/nested/data.bin'), {
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/content`, 'repository', '/nested/data.bin'), {
         headers: headers(),
     });
     assert.equal(response.status, 200);
@@ -99,6 +106,108 @@ test('HyperExpress v7 routes enforce auth/protocol and stream exact file content
     assert.equal(response.headers.get(MODIFIED_HEADER), String(modified_at));
     assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from([0, 1, 2, 3]));
     assert.deepEqual(errors, []);
+});
+
+test('authority revisions serialize mutations and make retries idempotent', async (t) => {
+    const root = await temporary_directory(t, 'directory-sync-revisions-');
+    const base = Date.now() - 20_000;
+    await write_file(root, '/shared.txt', 'initial', base);
+    const { errors, port } = await create_server(t, root);
+
+    let response = await fetch(endpoint(port, `${PROTOCOL_PATH}/manifest`), { headers: headers() });
+    const manifest = await response.json();
+    const revision_headers = (revision) => ({
+        ...headers(),
+        [EPOCH_HEADER]: manifest.epoch,
+        [BASE_REVISION_HEADER]: String(revision),
+    });
+    const upload = (content, modified_at, revision) => fetch(
+        endpoint(port, `${PROTOCOL_PATH}/content`, 'repository', '/shared.txt'),
+        {
+            method: 'PUT',
+            headers: {
+                ...revision_headers(revision),
+                [MODIFIED_HEADER]: String(modified_at),
+                [HASH_HEADER]: sha256(content),
+                'content-length': String(Buffer.byteLength(content)),
+            },
+            body: content,
+        }
+    );
+
+    response = await upload('first', base + 1_000, 0);
+    assert.equal(response.status, 200);
+    let payload = await response.json();
+    assert.equal(payload.revision, 1);
+
+    response = await upload('second', base + 2_000, 0);
+    assert.equal(response.status, 200);
+    payload = await response.json();
+    assert.equal(payload.revision, 2);
+
+    response = await upload('second', base + 2_000, 0);
+    assert.equal(response.status, 200);
+    payload = await response.json();
+    assert.equal(payload.revision, 2);
+
+    response = await upload('causal', base - 10_000, 2);
+    assert.equal(response.status, 200);
+    payload = await response.json();
+    assert.equal(payload.revision, 3);
+    assert.equal(await FileSystem.readFile(Path.join(root, 'shared.txt'), 'utf8'), 'causal');
+
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/manifest`), { headers: headers() });
+    const updated = await response.json();
+    assert.equal(updated.epoch, manifest.epoch);
+    assert.equal(updated.versions['/shared.txt'], 3);
+    assert.deepEqual(errors, []);
+});
+
+test('a Server restart creates a new epoch and Mirrors converge new mutations', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-epoch-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-epoch-mirror-');
+    const modified_at = Date.now() - 10_000;
+    await write_file(server_root, '/epoch.txt', 'initial', modified_at);
+    const original = await create_server(t, server_root);
+    const mirror = await create_mirror(t, mirror_root, original.port);
+
+    let response = await fetch(endpoint(original.port, `${PROTOCOL_PATH}/manifest`), {
+        headers: { ...headers(), connection: 'close' },
+    });
+    const original_epoch = (await response.json()).epoch;
+    await original.server.destroy();
+
+    const replacement = new Server({ port: original.port, auth: 'secret' });
+    const replacement_errors = capture_errors(replacement);
+    t.after(() => replacement.destroy());
+    await replacement.ready();
+    await replacement.host('repository', server_root, { watcher: WATCHER });
+
+    const replacement_manifest = await wait_for(async () => {
+        try {
+            response = await fetch(endpoint(original.port, `${PROTOCOL_PATH}/manifest`), {
+                headers: { ...headers(), connection: 'close' },
+            });
+            if (!response.ok) return undefined;
+            return response.json();
+        } catch {
+            return undefined;
+        }
+    });
+    assert.notEqual(replacement_manifest.epoch, original_epoch);
+    assert.equal(replacement_manifest.versions['/epoch.txt'], 0);
+
+    await write_file(mirror_root, '/epoch.txt', 'after-restart', modified_at + 5_000);
+    await wait_for(async () =>
+        (await read_if_exists(Path.join(server_root, 'epoch.txt'))) === 'after-restart',
+    { diagnostic: async () => ({
+        server: replacement.hosts.repository.map.get_entry('/epoch.txt'),
+        mirror: mirror.mirror.map.get_entry('/epoch.txt'),
+        mirror_errors: mirror.errors.map((error) => error.message),
+        replacement_errors: replacement_errors.map((error) => error.message),
+    }) });
+    assert.deepEqual(mirror.errors, []);
+    assert.deepEqual(replacement_errors, []);
 });
 
 test('server rejects malformed, oversized, stale, and filtered mutations', async (t) => {
@@ -118,7 +227,7 @@ test('server rejects malformed, oversized, stale, and filtered mutations', async
         filters: { keep: { extensions: ['.txt'] } },
     });
 
-    let response = await fetch(endpoint(port, '/v3/content', 'repository', '/large.txt'), {
+    let response = await fetch(endpoint(port, `${PROTOCOL_PATH}/content`, 'repository', '/large.txt'), {
         method: 'PUT',
         headers: {
             ...headers(),
@@ -130,7 +239,7 @@ test('server rejects malformed, oversized, stale, and filtered mutations', async
     });
     assert.equal(response.status, 413);
 
-    response = await fetch(endpoint(port, '/v3/content', 'repository', '/bad.txt'), {
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/content`, 'repository', '/bad.txt'), {
         method: 'PUT',
         headers: {
             ...headers(),
@@ -144,7 +253,7 @@ test('server rejects malformed, oversized, stale, and filtered mutations', async
     assert.equal((await response.json()).code, 'CHECKSUM');
 
     const current = server.hosts.repository.map.get_entry('/current.txt');
-    response = await fetch(endpoint(port, '/v3/entry', 'repository', '/current.txt'), {
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/entry`, 'repository', '/current.txt'), {
         method: 'DELETE',
         headers: { ...headers(), 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -156,7 +265,7 @@ test('server rejects malformed, oversized, stale, and filtered mutations', async
     assert.equal(response.status, 409);
     assert.equal((await response.json()).entry.type, 'file');
 
-    response = await fetch(endpoint(port, '/v3/entry', 'repository', '/blocked.bin'), {
+    response = await fetch(endpoint(port, `${PROTOCOL_PATH}/entry`, 'repository', '/blocked.bin'), {
         method: 'DELETE',
         headers: { ...headers(), 'content-type': 'application/json' },
         body: JSON.stringify({ type: 'tombstone', target: 'file', deleted_at: Date.now() }),
@@ -183,10 +292,21 @@ test('server authority converges two mirrors with newest-mtime conflict resoluti
 
     const mirror_time = base + 5_000;
     await write_file(first_root, '/shared.txt', 'from-first', mirror_time);
-    await wait_for(async () =>
+    await wait_for(async () => (
         (await read_if_exists(Path.join(server_root, 'shared.txt'))) === 'from-first' &&
         (await read_if_exists(Path.join(second_root, 'shared.txt'))) === 'from-first'
-    );
+    ), { diagnostic: async () => ({
+        server_content: await read_if_exists(Path.join(server_root, 'shared.txt')),
+        first_content: await read_if_exists(Path.join(first_root, 'shared.txt')),
+        second_content: await read_if_exists(Path.join(second_root, 'shared.txt')),
+        server: server_record.server.hosts.repository.map.canonical_entry('/shared.txt'),
+        first: first_record.mirror.map.canonical_entry('/shared.txt'),
+        second: second_record.mirror.map.canonical_entry('/shared.txt'),
+        first_watched: first_record.mirror.map.watcher.getWatched(),
+        server_errors: server_record.errors.map((error) => error.message),
+        first_errors: first_record.errors.map((error) => error.message),
+        second_errors: second_record.errors.map((error) => error.message),
+    }) });
     await wait_for(() =>
         server_record.server.hosts.repository.map.get_entry('/shared.txt')?.sha256 === sha256('from-first') &&
         second_record.mirror.map.get_entry('/shared.txt')?.sha256 === sha256('from-first')
@@ -194,9 +314,14 @@ test('server authority converges two mirrors with newest-mtime conflict resoluti
 
     const authority_time = mirror_time + 5_000;
     await write_file(server_root, '/shared.txt', 'from-authority', authority_time);
-    await wait_for(() =>
+    await wait_for(() => (
         server_record.server.hosts.repository.map.get_entry('/shared.txt')?.sha256 === sha256('from-authority')
-    );
+    ), { diagnostic: async () => ({
+        content: await read_if_exists(Path.join(server_root, 'shared.txt')),
+        entry: server_record.server.hosts.repository.map.get_entry('/shared.txt'),
+        watched: server_record.server.hosts.repository.map.watcher.getWatched(),
+        errors: server_record.errors.map((error) => error.message),
+    }) });
     await wait_for(async () => (
         (await read_if_exists(Path.join(first_root, 'shared.txt'))) === 'from-authority' &&
         (await read_if_exists(Path.join(second_root, 'shared.txt'))) === 'from-authority'
@@ -221,12 +346,26 @@ test('server authority converges two mirrors with newest-mtime conflict resoluti
     await FileSystem.rm(Path.join(first_root, 'shared.txt'));
     first_record = await create_mirror(t, first_root, server_record.port);
     await wait_for(async () =>
+        (await read_if_exists(Path.join(first_root, 'shared.txt'))) === 'from-authority'
+    );
+
+    await FileSystem.rm(Path.join(first_root, 'shared.txt'));
+    await wait_for(async () => (
         (await read_if_exists(Path.join(server_root, 'shared.txt'))) === undefined &&
         (await read_if_exists(Path.join(second_root, 'shared.txt'))) === undefined
-    );
-    assert.equal(server_record.server.hosts.repository.map.manifest['/shared.txt'].type, 'tombstone');
+    ), { diagnostic: async () => ({
+        server_content: await read_if_exists(Path.join(server_root, 'shared.txt')),
+        first: first_record.mirror.map.canonical_entry('/shared.txt'),
+        server: server_record.server.hosts.repository.map.canonical_entry('/shared.txt'),
+        tombstone: server_record.server.hosts.repository.map.get_tombstone('/shared.txt'),
+        server_errors: server_record.errors.map((error) => error.message),
+        first_errors: first_record.errors.map((error) => error.message),
+        second_errors: second_record.errors.map((error) => error.message),
+    }) });
+    assert.equal(server_record.server.hosts.repository.map.manifest['/shared.txt'], undefined);
 
-    const deletion = server_record.server.hosts.repository.map.manifest['/shared.txt'];
+    const deletion = server_record.server.hosts.repository.map.get_tombstone('/shared.txt');
+    assert.equal(deletion.type, 'tombstone');
     await wait(150);
     await write_file(server_root, '/shared.txt', 'resurrected', deletion.deleted_at + 1);
     await wait_for(() =>
@@ -246,6 +385,12 @@ test('server authority converges two mirrors with newest-mtime conflict resoluti
         first_errors: first_record.errors.map((error) => error.message),
         second_errors: second_record.errors.map((error) => error.message),
     }) });
+
+    let response = await fetch(endpoint(server_record.port, `${PROTOCOL_PATH}/manifest`), { headers: headers() });
+    const stable_revision = (await response.json()).versions['/shared.txt'];
+    await wait(500);
+    response = await fetch(endpoint(server_record.port, `${PROTOCOL_PATH}/manifest`), { headers: headers() });
+    assert.equal((await response.json()).versions['/shared.txt'], stable_revision);
 
     assert.deepEqual(server_record.errors, []);
     assert.deepEqual(first_record.errors, []);

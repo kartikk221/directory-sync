@@ -41,6 +41,17 @@ test('TaskQueue preserves legacy throttle rate and interval options', async () =
     assert.ok(starts[2] - starts[1] >= 20, `Second gap was ${starts[2] - starts[1]}ms.`);
 });
 
+test('TaskQueue drains a large backlog without losing or retaining work', async () => {
+    const queue = new TaskQueue({ concurrency: 100 });
+    const tasks = [];
+    let completed = 0;
+    for (let index = 0; index < 5_000; index++)
+        tasks.push(queue.run(() => completed++));
+    await Promise.all(tasks);
+    assert.equal(completed, 5_000);
+    assert.equal(queue.size, 0);
+});
+
 test('KeyedQueue serializes each URI without blocking independent URIs', async () => {
     const queue = new KeyedQueue();
     const events = [];

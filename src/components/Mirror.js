@@ -8,18 +8,22 @@ import DirectoryManager from './directory/DirectoryManager.js';
 import {
     ACTOR_HEADER,
     AUTH_HEADER,
+    BASE_REVISION_HEADER,
+    EPOCH_HEADER,
     HASH_HEADER,
     MODIFIED_HEADER,
     PROTOCOL_HEADER,
+    PROTOCOL_PATH,
     PROTOCOL_VERSION,
+    REVISION_HEADER,
 } from '../constants.js';
 import { KeyedQueue, TaskQueue } from '../utils/queues.js';
 import {
     abort_error,
     async_wait,
+    canonicalize_uri,
     compare_entries,
     entries_equivalent,
-    entry_timestamp,
     merge_options,
     safe_json_parse,
     validate_entry,
@@ -33,13 +37,14 @@ const DEFAULT_OPTIONS = {
     auth: '',
     retry: { every: 1_000, backoff: true },
     queue: {
-        max_concurrent: 10,
+        max_concurrent: 100,
         max_queued: Infinity,
         timeout: Infinity,
         throttle: { rate: Infinity, interval: Infinity },
     },
     state: {},
     hashing: {},
+    limits: { max_file_size: 100 * 1024 * 1024 },
     watcher: {},
     filters: undefined,
 };
@@ -113,7 +118,7 @@ class PooledWebsocket {
             this.#socket?.readyState === Websocket.CONNECTING
         ) return;
         const { auth, hostname, port, ssl } = this.#options;
-        const socket = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}/v3/events`, {
+        const socket = new Websocket(`${ssl ? 'wss' : 'ws'}://${hostname}:${port}${PROTOCOL_PATH}/events`, {
             headers: {
                 [AUTH_HEADER]: auth,
                 [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
@@ -162,21 +167,47 @@ class PooledWebsocket {
     }
 }
 
-function effective_ref(manifest, uri) {
-    // A directory tombstone is also the effective entry for older descendants.
-    // Returning its own URI deduplicates a whole deleted subtree into one action.
-    let selected = manifest[uri] ? { uri, entry: manifest[uri] } : undefined;
-    let parent = Path.posix.dirname(uri);
-    while (parent && parent !== '/') {
-        const candidate = manifest[parent];
+function index_tombstones(records) {
+    const directories = new Map();
+    const exact = new Map();
+    for (const record of records || []) {
+        if (canonicalize_uri(record.uri) !== record.uri) throw new TypeError('Tombstone URI must be canonical.');
+        validate_entry(record.entry);
+        if (record.entry.type !== 'tombstone') throw new TypeError('Expected a tombstone entry.');
+        if (!Number.isSafeInteger(record.revision) || record.revision < 0)
+            throw new TypeError('Tombstone revision must be a non-negative safe integer.');
+        const current = exact.get(record.uri);
         if (
-            candidate?.type === 'tombstone' &&
-            candidate.target === 'directory' &&
-            (!selected || candidate.deleted_at >= entry_timestamp(selected.entry))
-        ) selected = { uri: parent, entry: candidate };
-        const next = Path.posix.dirname(parent);
-        if (next === parent) break;
-        parent = next;
+            record.entry.include_self !== false &&
+            (!current || record.revision > current.revision || (
+                record.revision === current.revision &&
+                record.entry.deleted_at > current.entry.deleted_at
+            ))
+        ) exact.set(record.uri, record);
+        if (record.entry.target === 'directory') {
+            const directory = directories.get(record.uri);
+            if (!directory || record.revision > directory.revision || (
+                record.revision === directory.revision &&
+                record.entry.deleted_at > directory.entry.deleted_at
+            ))
+                directories.set(record.uri, record);
+        }
+    }
+    return { directories, exact };
+}
+
+function effective_tombstone(index, uri) {
+    let selected = index.exact.get(uri);
+    let cursor = Path.posix.dirname(uri);
+    while (cursor && cursor !== '/') {
+        const record = index.directories.get(cursor);
+        if (record && (!selected || record.revision > selected.revision || (
+            record.revision === selected.revision &&
+            record.entry.deleted_at > selected.entry.deleted_at
+        ))) selected = record;
+        const parent = Path.posix.dirname(cursor);
+        if (parent === cursor) break;
+        cursor = parent;
     }
     return selected;
 }
@@ -185,6 +216,17 @@ function action_priority(entry) {
     if (entry.type === 'tombstone') return 0;
     if (entry.type === 'directory') return 1;
     return 2;
+}
+
+function uri_depth(uri) {
+    let depth = 0;
+    for (let index = 0; index < uri.length; index++)
+        if (uri.charCodeAt(index) === 47) depth++;
+    return depth;
+}
+
+function yield_event_loop() {
+    return new Promise((resolve) => setImmediate(resolve));
 }
 
 /**
@@ -201,19 +243,27 @@ function action_priority(entry) {
 export default class Mirror extends EventEmitter {
     #abort_controller = new AbortController();
     #actor = randomUUID();
+    #clock_offset = 0;
     #destroy_promise;
     #destroyed = false;
+    #epoch;
     #event_chain = Promise.resolve();
     #host;
+    #initialized = false;
+    #initial_remote_promise;
     #manager;
     #map;
     #options;
+    #pending_mutations = [];
     #pool;
     #ready_promise;
     #reconcile_again = false;
     #reconcile_promise;
     #transfer_queue;
+    #versions = new Map();
     #work = new KeyedQueue();
+    #socket_ready_promise;
+    #socket_ready_resolve;
 
     /**
      * Creates a mirror and begins its initial authority reconciliation.
@@ -243,6 +293,9 @@ export default class Mirror extends EventEmitter {
             timeout: this.#options.queue.timeout,
             throttle: this.#options.queue.throttle,
         });
+        this.#socket_ready_promise = new Promise((resolve) => {
+            this.#socket_ready_resolve = resolve;
+        });
         this.#ready_promise = this._initialize();
         this.#ready_promise.catch((error) => this._emit_error(error));
     }
@@ -264,15 +317,11 @@ export default class Mirror extends EventEmitter {
     async _initialize() {
         const root = Path.resolve(this.#options.path);
         await FileSystem.mkdir(root, { recursive: true });
-        const response = await this._request('GET', '/v3/manifest');
-        const remote = await response.json();
-        if (remote.protocol !== PROTOCOL_VERSION || !remote.manifest)
-            throw new Error(`Remote does not support DirectorySync protocol v${PROTOCOL_VERSION}.`);
-
-        const map_options = merge_options(remote.options || {}, {
+        const map_options = merge_options({}, {
             path: root,
-            state: this.#options.state,
+            state: { ...this.#options.state, max_tombstones: 0 },
             hashing: this.#options.hashing,
+            limits: this.#options.limits,
             watcher: this.#options.watcher,
         });
         if (this.#options.filters !== undefined) map_options.filters = this.#options.filters;
@@ -283,9 +332,6 @@ export default class Mirror extends EventEmitter {
         this.#map.on('file_size_limit', (uri, record) =>
             this._log('SIZE_LIMIT_REACHED', `${uri} - SIZE_${record.stats.size}_BYTES`)
         );
-        await this.#map.ready();
-        await this._perform_hard_sync(remote.manifest, true);
-        this.#map.on('mutation', (uri, entry) => this._handle_local_mutation(uri, entry));
 
         const identity = pool_identity(this.#options);
         this.#pool = websocket_pool.get(identity);
@@ -294,7 +340,59 @@ export default class Mirror extends EventEmitter {
             websocket_pool.set(identity, this.#pool);
         }
         this.#pool.add(this);
+        await Promise.all([this.#map.ready(), this.#socket_ready_promise]);
+        const remote = await this.#initial_remote_promise;
+        await this._perform_hard_sync(remote);
+        await this.#map.settled();
+        this.#map.on('mutation', (uri, entry) => this._handle_local_mutation(uri, entry));
+        this.#initialized = true;
+        for (const message of this.#pending_mutations.splice(0)) this._receive_mutation(message);
         return this;
+    }
+
+    async _fetch_manifest() {
+        const started = Date.now();
+        const response = await this._request('GET', `${PROTOCOL_PATH}/manifest`);
+        const received = Date.now();
+        const payload = await response.json();
+        if (
+            payload.protocol !== PROTOCOL_VERSION ||
+            typeof payload.epoch !== 'string' || !payload.epoch ||
+            !payload.manifest ||
+            !Array.isArray(payload.tombstones) ||
+            !payload.versions || typeof payload.versions !== 'object' ||
+            !Number.isSafeInteger(payload.server_time)
+        ) throw new Error(`Remote does not support DirectorySync protocol v${PROTOCOL_VERSION}.`);
+        for (const uri of Object.keys(payload.manifest)) {
+            const revision = payload.versions[uri];
+            if (!Number.isSafeInteger(revision) || revision < 0)
+                throw new TypeError(`Manifest revision for ${uri} must be a non-negative safe integer.`);
+        }
+        if (this.#epoch && this.#epoch !== payload.epoch) this.#versions.clear();
+        this.#epoch = payload.epoch;
+        const offset = Math.round((started + received) / 2 - payload.server_time);
+        const uncertainty = Math.ceil((received - started) / 2) + 1;
+        // A one-shot midpoint estimate cannot distinguish a small clock offset
+        // from request latency. Treat that uncertainty band as zero so jitter
+        // cannot turn an exact mtime tie into a newer Mirror mutation.
+        this.#clock_offset = Math.abs(offset) <= uncertainty ? 0 : offset;
+        return payload;
+    }
+
+    _shift_entry(entry, offset) {
+        if (!entry) return undefined;
+        const shifted = { ...entry };
+        const key = entry.type === 'tombstone' ? 'deleted_at' : 'modified_at';
+        shifted[key] = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.round(entry[key] + offset)));
+        return shifted;
+    }
+
+    _normalize_local(entry) {
+        return this._shift_entry(entry, -this.#clock_offset);
+    }
+
+    _localize_remote(entry) {
+        return this._shift_entry(entry, this.#clock_offset);
     }
 
     _url(endpoint, uri) {
@@ -360,22 +458,62 @@ export default class Mirror extends EventEmitter {
         );
     }
 
-    async _apply_remote(uri, entry) {
+    _revision_headers(uri, revision = this.#versions.get(uri)) {
+        const headers = { [EPOCH_HEADER]: this.#epoch };
+        if (revision !== undefined) headers[BASE_REVISION_HEADER] = String(revision);
+        return headers;
+    }
+
+    _adopt_revision(uri, entry, revision, epoch = this.#epoch) {
+        if (epoch !== this.#epoch || !Number.isSafeInteger(revision) || revision < 0) return false;
+        const current = this.#versions.get(uri);
+        if (current !== undefined && current > revision) return false;
+        this.#versions.set(uri, revision);
+        if (entry?.type === 'tombstone' && entry.target === 'directory')
+            for (const candidate of this.#versions.keys())
+                if (candidate.startsWith(`${uri}/`)) this.#versions.set(candidate, revision);
+        return true;
+    }
+
+    async _apply_remote(uri, entry, revision, epoch = this.#epoch) {
         validate_entry(entry);
+        if (epoch !== this.#epoch) {
+            this._perform_hard_sync().catch((error) => this._emit_error(error));
+            return;
+        }
+        if (!Number.isSafeInteger(revision) || revision < 0)
+            throw new TypeError('Authority revision must be a non-negative safe integer.');
+        const known = this.#versions.get(uri);
+        if (known !== undefined && known > revision) return;
         const local = this.#map.canonical_entry(uri);
-        if (compare_entries(entry, local) === 1) return this._push_local(uri, local, entry);
-        if (entry.type === 'directory') return this.#manager.apply_directory(uri, entry);
-        if (entry.type === 'tombstone') return this.#manager.apply_tombstone(uri, entry);
+        const localized = this._localize_remote(entry);
         if (
+            entry.type === 'file' &&
             local?.type === 'file' &&
             local.size === entry.size &&
             local.sha256 === entry.sha256
-        ) return this.#manager.apply_metadata(uri, entry);
+        ) {
+            if (!entries_equivalent(local, localized)) await this.#manager.apply_metadata(uri, localized);
+            this._adopt_revision(uri, entry, revision, epoch);
+            return;
+        }
+        if (entry.type === 'directory') {
+            await this.#manager.apply_directory(uri, localized);
+            this._adopt_revision(uri, entry, revision, epoch);
+            return;
+        }
+        if (entry.type === 'tombstone') {
+            await this.#manager.apply_tombstone(uri, localized);
+            this._adopt_revision(uri, entry, revision, epoch);
+            return;
+        }
 
         const start = Date.now();
         this._log('DOWNLOAD', `${uri} - FILE - START`);
-        const response = await this._request('GET', '/v3/content', { uri });
+        const response = await this._request('GET', `${PROTOCOL_PATH}/content`, { uri });
         if (response.status === 404) return;
+        const actual_epoch = response.headers.get(EPOCH_HEADER);
+        const actual_revision = Number(response.headers.get(REVISION_HEADER));
         const actual = {
             type: 'file',
             modified_at: Number(response.headers.get(MODIFIED_HEADER)),
@@ -383,14 +521,22 @@ export default class Mirror extends EventEmitter {
             sha256: response.headers.get(HASH_HEADER),
         };
         validate_entry(actual);
-        if (compare_entries(actual, this.#map.canonical_entry(uri)) === 1) {
+        if (
+            actual_epoch !== this.#epoch ||
+            !Number.isSafeInteger(actual_revision) || actual_revision < revision
+        ) {
             await response.body?.cancel();
-            return this._push_local(uri, this.#map.canonical_entry(uri), actual);
+            this._perform_hard_sync().catch((error) => this._emit_error(error));
+            return;
         }
-        await this.#manager.apply_file(uri, response.body, actual, {
-            validate_before_commit: () =>
-                compare_entries(actual, this.#map.canonical_entry(uri)) <= 0,
+        const actual_local = this._localize_remote(actual);
+        await this.#manager.apply_file(uri, response.body, actual_local, {
+            validate_before_commit: () => {
+                const current = this.#map.canonical_entry(uri);
+                return (!current && !local) || entries_equivalent(current, local);
+            },
         });
+        this._adopt_revision(uri, actual, actual_revision, actual_epoch);
         this._log('DOWNLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start}ms`);
     }
 
@@ -400,7 +546,7 @@ export default class Mirror extends EventEmitter {
         // Queue entries are immutable snapshots. If the watcher has already seen
         // a newer local state, discard this stale transfer instead of uploading
         // content that no longer corresponds to the path on disk.
-        if (!entries_equivalent(this.#map.canonical_entry(uri), entry)) return;
+        if (entry.type !== 'tombstone' && !entries_equivalent(this.#map.canonical_entry(uri), entry)) return;
         if (entry.type === 'file') {
             try {
                 if (!(await FileSystem.lstat(this.#map.resolve(uri))).isFile()) return;
@@ -409,24 +555,40 @@ export default class Mirror extends EventEmitter {
                 throw error;
             }
         }
+        const wire_entry = this._normalize_local(entry);
+        const remote_entry = remote?.entry;
+        const headers = this._revision_headers(uri, remote?.revision);
         let response;
         if (entry.type === 'directory') {
-            response = await this._request('PUT', '/v3/directory', { uri, json: entry });
+            response = await this._request('PUT', `${PROTOCOL_PATH}/directory`, {
+                uri,
+                json: wire_entry,
+                headers,
+            });
         } else if (entry.type === 'tombstone') {
-            response = await this._request('DELETE', '/v3/entry', { uri, json: entry });
+            response = await this._request('DELETE', `${PROTOCOL_PATH}/entry`, {
+                uri,
+                json: wire_entry,
+                headers,
+            });
         } else if (
-            remote?.type === 'file' &&
-            remote.size === entry.size &&
-            remote.sha256 === entry.sha256
+            remote_entry?.type === 'file' &&
+            remote_entry.size === entry.size &&
+            remote_entry.sha256 === entry.sha256
         ) {
-            response = await this._request('PATCH', '/v3/content', { uri, json: entry });
+            response = await this._request('PATCH', `${PROTOCOL_PATH}/content`, {
+                uri,
+                json: wire_entry,
+                headers,
+            });
         } else {
             const start = Date.now();
             this._log('UPLOAD', `${uri} - FILE - START`);
-            response = await this._request('PUT', '/v3/content', {
+            response = await this._request('PUT', `${PROTOCOL_PATH}/content`, {
                 uri,
                 headers: {
-                    [MODIFIED_HEADER]: String(entry.modified_at),
+                    ...headers,
+                    [MODIFIED_HEADER]: String(wire_entry.modified_at),
                     [HASH_HEADER]: entry.sha256,
                     'content-length': String(entry.size),
                 },
@@ -434,75 +596,163 @@ export default class Mirror extends EventEmitter {
             });
             this._log('UPLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start}ms`);
         }
-        if (response.status === 409) {
-            const payload = await response.json().catch(() => ({}));
-            if (payload.entry) await this._apply_remote(uri, payload.entry);
-        } else {
-            const payload = await response.json().catch(() => ({}));
-            if (payload.entry && !entries_equivalent(payload.entry, entry))
-                await this._apply_remote(uri, payload.entry);
+        const payload = await response.json().catch(() => ({}));
+        if (
+            payload.epoch !== this.#epoch ||
+            !Number.isSafeInteger(payload.revision) || payload.revision < 0
+        ) {
+            this._perform_hard_sync().catch((error) => this._emit_error(error));
+            return;
         }
+        if (response.status === 409) {
+            if (payload.entry)
+                await this._apply_remote(uri, payload.entry, payload.revision, payload.epoch);
+            return;
+        }
+        if (payload.entry && !entries_equivalent(payload.entry, wire_entry))
+            await this._apply_remote(uri, payload.entry, payload.revision, payload.epoch);
+        else this._adopt_revision(uri, payload.entry, payload.revision, payload.epoch);
     }
 
-    _plan(remote, local) {
-        // Planning is allocation-bounded to one action per effective URI. The
-        // authority occupies the first compare_entries argument so it wins ties.
+    async _plan(remote, local) {
         const actions = new Map();
-        const uris = new Set([...Object.keys(remote), ...Object.keys(local)]);
+        const tombstones = index_tombstones(remote.tombstones);
+        const normalized_local = Object.create(null);
+        const effective_tombstones = new Map();
+        const local_uris = Object.keys(local);
+        let iterations = 0;
+        for (const uri of local_uris) {
+            normalized_local[uri] = this._normalize_local(local[uri]);
+            if (++iterations % 2_048 === 0) await yield_event_loop();
+        }
+
+        const uris = new Set(local_uris);
+        for (const uri of Object.keys(remote.manifest)) uris.add(uri);
+        for (const record of remote.tombstones) uris.add(record.uri);
         for (const uri of uris) {
-            const server = effective_ref(remote, uri);
-            const mirror = effective_ref(local, uri);
-            const comparison = compare_entries(server?.entry, mirror?.entry);
-            if (comparison === 0) continue;
+            if (++iterations % 2_048 === 0) await yield_event_loop();
+            const active = remote.manifest[uri];
+            const active_record = active ? {
+                uri,
+                entry: active,
+                revision: remote.versions[uri],
+            } : undefined;
+            let tombstone = effective_tombstones.get(uri);
+            if (!effective_tombstones.has(uri)) {
+                tombstone = effective_tombstone(tombstones, uri);
+                effective_tombstones.set(uri, tombstone);
+            }
+            let server = active_record;
+            if (
+                tombstone &&
+                !(active_record && tombstone.entry.target === 'directory' && tombstone.entry.include_self === false) &&
+                (!server || tombstone.revision > server.revision || (
+                    tombstone.revision === server.revision &&
+                    compare_entries(server.entry, tombstone.entry) === 1
+                ))
+            ) server = tombstone;
+            const mirror = normalized_local[uri];
+            if (
+                server?.entry.type === 'file' &&
+                mirror?.type === 'file' &&
+                server.entry.size === mirror.size &&
+                server.entry.sha256 === mirror.sha256
+            ) {
+                if (!entries_equivalent(server.entry, mirror)) {
+                    actions.set(`pull:file:${uri}`, {
+                        direction: 'pull',
+                        uri,
+                        record: server,
+                    });
+                } else actions.set(`adopt:${uri}`, { direction: 'adopt', uri, record: server });
+                continue;
+            }
+            if (server && entries_equivalent(server.entry, mirror)) {
+                actions.set(`adopt:${uri}`, { direction: 'adopt', uri, record: server });
+                continue;
+            }
+            const known = this.#versions.get(uri);
+            if (server?.uri === uri && known !== undefined && known === server.revision && mirror) {
+                actions.set(`push:${mirror.type}:${uri}`, {
+                    direction: 'push',
+                    uri,
+                    entry: local[uri],
+                    other: server,
+                });
+                continue;
+            }
+            const comparison = compare_entries(server?.entry, mirror);
             if (comparison < 0 && server) {
-                const key = `pull:${server.uri}`;
-                actions.set(key, {
+                actions.set(`pull:${server.entry.type}:${server.uri}`, {
                     direction: 'pull',
                     uri: server.uri,
-                    entry: server.entry,
-                    other: effective_ref(local, server.uri)?.entry,
+                    record: server,
                 });
             } else if (comparison > 0 && mirror) {
-                const key = `push:${mirror.uri}`;
-                actions.set(key, {
+                actions.set(`push:${mirror.type}:${uri}`, {
                     direction: 'push',
-                    uri: mirror.uri,
-                    entry: mirror.entry,
-                    other: effective_ref(remote, mirror.uri)?.entry,
+                    uri,
+                    entry: local[uri],
+                    other: server,
                 });
             }
         }
-        return [...actions.values()].sort((left, right) => {
-            const priority = action_priority(left.entry) - action_priority(right.entry);
+        const output = [...actions.values()];
+        for (const action of output) {
+            action.depth = uri_depth(action.uri);
+            action.type = action.entry?.type || action.record.entry.type;
+        }
+        return output.sort((left, right) => {
+            const priority = action_priority({ type: left.type }) - action_priority({ type: right.type });
             if (priority) return priority;
-            const depth = left.uri.split('/').length - right.uri.split('/').length;
+            const depth = left.depth - right.depth;
+            if (left.type === 'tombstone' && depth) return -depth;
             return depth || left.uri.localeCompare(right.uri);
         });
     }
 
-    async _reconcile_once(remote_manifest) {
-        let remote = remote_manifest;
-        if (!remote) {
-            const response = await this._request('GET', '/v3/manifest');
-            const payload = await response.json();
-            if (payload.protocol !== PROTOCOL_VERSION) throw new Error('DirectorySync protocol mismatch.');
-            remote = payload.manifest;
-        }
-        const actions = this._plan(remote, this.#map.manifest);
-        const perform = (action) => this._schedule(action.uri, () =>
-            action.direction === 'pull'
-                ? this._apply_remote(action.uri, action.entry)
-                : this._push_local(action.uri, action.entry, action.other)
-        );
+    async _reconcile_once(remote_state) {
+        if (!remote_state) remote_state = await this._fetch_manifest();
+        const remote = {
+            manifest: remote_state.manifest,
+            tombstones: remote_state.tombstones,
+            versions: remote_state.versions,
+        };
+        const actions = await this._plan(remote, this.#map.manifest);
+        const perform = (action) => this._schedule(action.uri, () => {
+            if (action.direction === 'adopt') {
+                this._adopt_revision(
+                    action.uri,
+                    action.record.entry,
+                    action.record.revision,
+                    remote_state.epoch
+                );
+                return;
+            }
+            return action.direction === 'pull'
+                ? this._apply_remote(
+                    action.uri,
+                    action.record.entry,
+                    action.record.revision,
+                    remote_state.epoch
+                )
+                : this._push_local(action.uri, action.entry, action.other);
+        });
         // Tombstones go first to remove stale type conflicts, directories create
         // parents for files, and a final deepest-first directory metadata pass
         // restores mtimes changed while child files were written.
+        const directories = [];
+        const files = [];
         for (const action of actions)
-            if (action.entry.type === 'tombstone') await perform(action);
-        const directories = actions.filter((action) => action.entry.type === 'directory');
-        await Promise.all(directories.map(perform));
-        await Promise.all(actions.filter((action) => action.entry.type === 'file').map(perform));
-        directories.sort((left, right) => right.uri.split('/').length - left.uri.split('/').length);
+            if (action.direction === 'adopt') await perform(action);
+            else if (action.type === 'tombstone') await perform(action);
+            else if (action.type === 'directory') directories.push(action);
+            else files.push(action);
+        for (const action of directories) await perform(action);
+        const transfers = [];
+        for (const action of files) transfers.push(perform(action));
+        await Promise.all(transfers);
+        directories.sort((left, right) => right.depth - left.depth);
         for (const action of directories) await perform(action);
     }
 
@@ -510,11 +760,10 @@ export default class Mirror extends EventEmitter {
      * Reconciles a complete authority manifest, coalescing overlapping requests.
      *
      * @protected
-     * @param {Record<string, import('../../index.js').Entry>} [manifest] Optional already-fetched authority manifest.
-     * @param {boolean} [initial=false] Fetch a second manifest to close the startup scan window.
+     * @param {object} [state] Optional already-fetched authority state.
      * @returns {Promise<void>}
      */
-    _perform_hard_sync(manifest, initial = false) {
+    _perform_hard_sync(state) {
         if (this.#reconcile_promise) {
             this.#reconcile_again = true;
             return this.#reconcile_promise;
@@ -522,8 +771,7 @@ export default class Mirror extends EventEmitter {
         this.#reconcile_promise = (async () => {
             const start = Date.now();
             this._log('HARD_SYNC', 'START');
-            await this._reconcile_once(manifest);
-            if (initial) await this._reconcile_once();
+            await this._reconcile_once(state);
             while (this.#reconcile_again && !this.#destroyed) {
                 this.#reconcile_again = false;
                 await this._reconcile_once();
@@ -544,12 +792,18 @@ export default class Mirror extends EventEmitter {
             });
     }
 
-    /** @protected @param {object} message Protocol-v3 mutation event. @returns {void} */
+    /** @protected @param {object} message Protocol mutation event. @returns {void} */
     _receive_mutation(message) {
         if (message.actor === this.#actor || this.#destroyed) return;
+        if (!this.#initialized) {
+            this.#pending_mutations.push(message);
+            return;
+        }
         this.#event_chain = this.#event_chain
             .catch(() => undefined)
-            .then(() => this._schedule(message.uri, () => this._apply_remote(message.uri, message.entry)));
+            .then(() => this._schedule(message.uri, () =>
+                this._apply_remote(message.uri, message.entry, message.revision, message.epoch)
+            ));
         this.#event_chain.catch((error) => {
             if (!this.#destroyed) this._emit_error(error);
         });
@@ -558,6 +812,11 @@ export default class Mirror extends EventEmitter {
     /** @protected @param {boolean} reconnect Whether this socket was previously connected. @returns {void} */
     _on_socket_ready(reconnect) {
         this._log('WEBSOCKET', `${reconnect ? 'RECONNECTED' : 'CONNECTED'} - ${this.#options.hostname}:${this.#options.port}`);
+        if (!this.#initialized) {
+            this.#initial_remote_promise ||= this._fetch_manifest();
+            this.#socket_ready_resolve();
+            return;
+        }
         this._perform_hard_sync().catch((error) => this._emit_error(error));
     }
 

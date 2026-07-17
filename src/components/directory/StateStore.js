@@ -1,339 +1,199 @@
-import FileSystem from 'node:fs/promises';
 import Path from 'node:path';
-import { randomUUID } from 'node:crypto';
-import {
-    canonicalize_uri,
-    entry_timestamp,
-    safe_json_parse,
-    validate_entry,
-} from '../../utils/operators.js';
-
-const STATE_VERSION = 1;
+import { canonicalize_uri, entry_timestamp, validate_entry } from '../../utils/operators.js';
 
 /**
- * Durable metadata store for active entries and deletion tombstones.
+ * In-memory store for active metadata and Server tombstones.
  *
- * Tombstone writes are appended to an NDJSON journal before acknowledgment.
- * Periodic atomic snapshots bound recovery cost and replace the journal. Map
- * insertion order is the eviction order, so the oldest retained tombstone is
- * removed when max_tombstones is exceeded.
+ * DirectorySync deliberately persists no private state. Active entries are
+ * rebuilt from the filesystem on startup, while tombstones live only for the
+ * lifetime of the hosting Server process.
  */
 export default class StateStore {
     #active = new Map();
-    #closed = false;
-    #journal_records = 0;
-    #ledger_path;
     #log;
-    #manifest_path;
     #max_tombstones;
-    #sequence = 0;
-    #snapshot_timer;
-    #state_path;
     #tombstones = new Map();
-    #write_chain = Promise.resolve();
 
     /**
-     * @param {string} root Synchronized repository root.
-     * @param {import('../../../index.js').StateOptions} [options={}] State path and tombstone limit.
-     * @param {(code: string, message: string) => void} [log] State diagnostic callback.
+     * @param {import('../../../index.js').StateOptions} [options={}] In-memory tombstone limit.
+     * @param {(code: string, message: string) => void} [log] Diagnostic callback.
      */
-    constructor(root, options = {}, log = () => undefined) {
-        this.#state_path = Path.resolve(options.path || Path.join(root, '.directory-sync'));
+    constructor(options = {}, log = () => undefined) {
         this.#max_tombstones = options.max_tombstones ?? 10_000;
         if (!Number.isSafeInteger(this.#max_tombstones) || this.#max_tombstones < 0)
             throw new TypeError('state.max_tombstones must be a non-negative safe integer.');
-        this.#manifest_path = Path.join(this.#state_path, 'manifest.json');
-        this.#ledger_path = Path.join(this.#state_path, 'tombstones.ndjson');
         this.#log = log;
     }
 
-    /** @returns {Promise<void>} Loads the snapshot and replays the tombstone journal. */
-    async initialize() {
-        await FileSystem.mkdir(this.tmp_path, { recursive: true });
-        await this._load_manifest();
-        await this._load_ledger();
-        if (await this._enforce_limit()) await this.compact();
-    }
-
-    async _load_manifest() {
-        let raw;
-        try {
-            raw = await FileSystem.readFile(this.#manifest_path, 'utf8');
-        } catch (error) {
-            if (error.code !== 'ENOENT') this.#log('STATE_REBUILT', `Unable to read state: ${error.message}`);
-            return;
-        }
-
-        try {
-            const parsed = JSON.parse(raw);
-            if (parsed.version !== STATE_VERSION) throw new Error('Unsupported state version.');
-            for (const [uri, entry] of Object.entries(parsed.active || {})) {
-                canonicalize_uri(uri);
-                validate_entry(entry);
-                if (entry.type !== 'tombstone') this.#active.set(uri, entry);
-            }
-            for (const record of parsed.tombstones || []) this._apply_record(record);
-            this.#sequence = Math.max(this.#sequence, parsed.sequence || 0);
-        } catch (error) {
-            this.#active.clear();
-            this.#tombstones.clear();
-            this.#log('STATE_REBUILT', `Discarded invalid state: ${error.message}`);
-        }
-    }
-
-    async _load_ledger() {
-        let raw;
-        try {
-            raw = await FileSystem.readFile(this.#ledger_path, 'utf8');
-        } catch (error) {
-            if (error.code !== 'ENOENT') this.#log('STATE_REBUILT', `Unable to read ledger: ${error.message}`);
-            return;
-        }
-        // Each line is independently durable. A crash may truncate only the final
-        // record, which can be ignored without discarding earlier deletions.
-        for (const line of raw.split('\n')) {
-            if (!line.trim()) continue;
-            const record = safe_json_parse(line);
-            if (!record) {
-                this.#log('STATE_REBUILT', 'Ignored an incomplete tombstone journal record.');
-                continue;
-            }
-            try {
-                this._apply_record(record);
-                this.#journal_records++;
-            } catch (error) {
-                this.#log('STATE_REBUILT', `Ignored invalid journal record: ${error.message}`);
-            }
-        }
-    }
-
-    _apply_record(record, validate = true) {
-        const uri = canonicalize_uri(record.uri);
-        if (record.op === 'drop') {
-            this.#tombstones.delete(uri);
-            return;
-        }
-        if (record.op !== 'put') throw new Error(`Unknown journal operation '${record.op}'.`);
-        if (validate) validate_entry(record.entry);
-        if (record.entry.type !== 'tombstone') throw new Error('Journal entries must be tombstones.');
-        const sequence = Number.isSafeInteger(record.sequence) && record.sequence >= 0
-            ? record.sequence
-            : ++this.#sequence;
-        this.#sequence = Math.max(this.#sequence, sequence);
-        this.#tombstones.delete(uri);
-        this.#tombstones.set(uri, { entry: record.entry, sequence });
-    }
-
-    _enqueue(handler) {
-        this.#write_chain = this.#write_chain.catch(() => undefined).then(handler);
-        return this.#write_chain;
-    }
-
-    async _append(record) {
-        await FileSystem.appendFile(this.#ledger_path, `${JSON.stringify(record)}\n`, 'utf8');
-        this.#journal_records++;
-    }
-
-    /** @param {string} uri Repository URI. @returns {import('../../../index.js').Entry|undefined} Cached active metadata. */
+    /** @param {string} uri Repository URI. @returns {import('../../../index.js').Entry|undefined} In-memory active metadata. */
     get_cached(uri) {
-        return this.#active.get(uri);
-    }
-
-    /** @param {string} uri Repository URI. @returns {import('../../../index.js').TombstoneEntry|undefined} Exact tombstone. */
-    get_tombstone(uri) {
-        return this.#tombstones.get(uri)?.entry;
+        return this.#active.get(canonicalize_uri(uri));
     }
 
     /**
-     * Finds the newest exact or ancestor-directory tombstone covering a URI.
+     * Returns the newest exact tombstone, optionally restricted by deleted type.
+     *
+     * @param {string} uri Repository URI.
+     * @param {'file'|'directory'} [target] Optional deleted entry type.
+     * @returns {import('../../../index.js').TombstoneEntry|undefined}
+     */
+    get_tombstone(uri, target) {
+        const canonical = canonicalize_uri(uri);
+        if (target) return this.#tombstones.get(`${target}:${canonical}`)?.entry;
+        const file = this.#tombstones.get(`file:${canonical}`)?.entry;
+        const directory = this.#tombstones.get(`directory:${canonical}`)?.entry;
+        if (!file) return directory;
+        if (!directory) return file;
+        return file.deleted_at > directory.deleted_at ? file : directory;
+    }
+
+    /** @param {string} uri Repository URI. @param {'file'|'directory'} target Deleted type. */
+    get_tombstone_record(uri, target) {
+        return this.#tombstones.get(`${target}:${canonicalize_uri(uri)}`);
+    }
+
+    /**
+     * Finds the newest exact tombstone or ancestor directory tombstone covering a URI.
      *
      * @param {string} uri Repository URI.
      * @returns {import('../../../index.js').TombstoneEntry|undefined}
      */
     effective_tombstone(uri) {
+        return this.effective_tombstone_record(uri)?.entry;
+    }
+
+    /**
+     * Finds the newest effective tombstone together with the URI that owns it.
+     *
+     * @param {string} uri Repository URI.
+     * @returns {{uri: string, entry: import('../../../index.js').TombstoneEntry}|undefined}
+     */
+    effective_tombstone_record(uri) {
         const canonical = canonicalize_uri(uri);
+        const file = this.#tombstones.get(`file:${canonical}`);
+        const directory = this.#tombstones.get(`directory:${canonical}`);
         let selected;
-        let cursor = canonical;
+        for (const record of [file, directory]) {
+            if (!record || record.entry.include_self === false) continue;
+            if (!selected || record.entry.deleted_at > selected.entry.deleted_at) selected = record;
+        }
+        let cursor = Path.posix.dirname(canonical);
         while (cursor && cursor !== '/') {
-            const record = this.#tombstones.get(cursor);
-            if (record) {
-                const is_self = cursor === canonical;
-                if ((!is_self || record.entry.include_self !== false) && (!selected || record.entry.deleted_at > selected.deleted_at))
-                    selected = record.entry;
-            }
+            const candidate = this.#tombstones.get(`directory:${cursor}`);
+            if (candidate && (!selected || candidate.entry.deleted_at > selected.entry.deleted_at))
+                selected = candidate;
             const parent = Path.posix.dirname(cursor);
             cursor = parent === cursor ? '/' : parent;
         }
         return selected;
     }
 
-    /**
-     * Stores active metadata and retires an older exact tombstone on resurrection.
-     * Directory tombstones remain with include_self=false so older descendants
-     * still receive the historical deletion.
-     *
-     * @param {string} uri Repository URI.
-     * @param {import('../../../index.js').FileEntry|import('../../../index.js').DirectoryEntry} entry Active metadata.
-     * @returns {void}
-     */
+    /** @param {string} uri Repository URI. @param {import('../../../index.js').FileEntry|import('../../../index.js').DirectoryEntry} entry Active metadata. */
     set_active(uri, entry) {
-        canonicalize_uri(uri);
+        const canonical = canonicalize_uri(uri);
         validate_entry(entry);
-        this.#active.set(uri, entry);
-
-        const exact = this.#tombstones.get(uri);
-        if (exact && entry_timestamp(entry) > exact.entry.deleted_at) {
-            if (exact.entry.target === 'directory') {
-                exact.entry = { ...exact.entry, include_self: false };
-                this._enqueue(() =>
-                    this._append({ op: 'put', uri, entry: exact.entry, sequence: exact.sequence })
-                );
-            } else {
-                this.#tombstones.delete(uri);
-                this._enqueue(() => this._append({ op: 'drop', uri }));
-            }
-        }
-        this.schedule_snapshot();
+        this.#active.set(canonical, entry);
     }
 
-    /** @param {string} uri Repository URI. @returns {void} */
+    /** @param {string} uri Repository URI. */
     remove_active(uri) {
-        this.#active.delete(uri);
-        this.schedule_snapshot();
+        this.#active.delete(canonicalize_uri(uri));
     }
 
-    /** @param {string} uri Repository URI prefix. @returns {void} */
+    /** @param {string} uri Repository URI prefix. */
     remove_active_tree(uri) {
         const canonical = canonicalize_uri(uri);
-        for (const candidate of [...this.#active.keys()]) {
-            if (candidate === canonical || candidate.startsWith(`${canonical}/`))
-                this.#active.delete(candidate);
-        }
-        this.schedule_snapshot();
+        for (const candidate of [...this.#active.keys()])
+            if (candidate === canonical || candidate.startsWith(`${canonical}/`)) this.#active.delete(candidate);
     }
 
-    /** @param {Iterable<[string, import('../../../index.js').Entry]>} entries Complete active snapshot. @returns {void} */
+    /** @param {Iterable<[string, import('../../../index.js').Entry]>} entries Complete active snapshot. */
     replace_active(entries) {
         this.#active = new Map(entries);
-        this.schedule_snapshot();
     }
 
     /**
-     * Durably records a deletion unless an equal/newer covering deletion exists.
+     * Adds a bounded tombstone while removing only deletion records it subsumes.
      *
      * @param {string} uri Repository URI.
      * @param {import('../../../index.js').TombstoneEntry} entry Deletion record.
      * @returns {Promise<import('../../../index.js').TombstoneEntry>}
      */
     async record_tombstone(uri, entry) {
-        canonicalize_uri(uri);
+        const canonical = canonicalize_uri(uri);
         validate_entry(entry);
         if (entry.type !== 'tombstone') throw new TypeError('Expected a tombstone entry.');
 
-        const exact = this.get_tombstone(uri);
-        if (exact && exact.deleted_at >= entry.deleted_at) return exact;
-        const ancestor = this.effective_tombstone(uri);
-        if (ancestor && ancestor.deleted_at >= entry.deleted_at) return ancestor;
+        const ancestor = this._ancestor_directory_tombstone(canonical);
+        if (ancestor?.deleted_at >= entry.deleted_at) return ancestor;
 
-        let compact = false;
+        const key = `${entry.target}:${canonical}`;
+        const exact = this.#tombstones.get(key);
+        if (exact?.entry.deleted_at >= entry.deleted_at) return exact.entry;
+
         if (entry.target === 'directory') {
-            for (const candidate of [...this.#tombstones.keys()]) {
-                if (candidate.startsWith(`${uri}/`)) {
-                    this.#tombstones.delete(candidate);
-                    compact = true;
-                }
+            for (const [candidate, value] of this.#tombstones) {
+                if (
+                    value.uri.startsWith(`${canonical}/`) &&
+                    value.entry.deleted_at <= entry.deleted_at
+                ) this.#tombstones.delete(candidate);
             }
         }
 
-        const sequence = ++this.#sequence;
-        this.#tombstones.delete(uri);
         const normalized = { ...entry, include_self: entry.include_self ?? true };
-        this.#tombstones.set(uri, { entry: normalized, sequence });
-        await this._enqueue(() => this._append({ op: 'put', uri, entry: normalized, sequence }));
-        if (await this._enforce_limit()) compact = true;
-        if (compact || this.#journal_records > Math.max(1, this.#max_tombstones * 2)) await this.compact();
-        else this.schedule_snapshot();
+        this.#tombstones.delete(key);
+        this.#tombstones.set(key, { uri: canonical, entry: normalized });
+        this._enforce_limit();
         return normalized;
     }
 
-    async _enforce_limit() {
-        let evicted = false;
+    _ancestor_directory_tombstone(uri) {
+        let selected;
+        let cursor = Path.posix.dirname(uri);
+        while (cursor && cursor !== '/') {
+            const candidate = this.get_tombstone(cursor, 'directory');
+            if (candidate && (!selected || candidate.deleted_at > selected.deleted_at)) selected = candidate;
+            const parent = Path.posix.dirname(cursor);
+            cursor = parent === cursor ? '/' : parent;
+        }
+        return selected;
+    }
+
+    _enforce_limit() {
         while (this.#tombstones.size > this.#max_tombstones) {
-            const oldest = this.#tombstones.keys().next().value;
-            this.#tombstones.delete(oldest);
-            this.#log('TOMBSTONE_EVICTED', oldest);
-            evicted = true;
+            let oldest_key;
+            let oldest;
+            for (const [key, value] of this.#tombstones) {
+                if (!oldest || value.entry.deleted_at < oldest.entry.deleted_at) {
+                    oldest_key = key;
+                    oldest = value;
+                }
+            }
+            this.#tombstones.delete(oldest_key);
+            this.#log('TOMBSTONE_EVICTED', oldest.uri);
         }
-        return evicted;
-    }
-
-    /** @returns {void} Schedules one coalesced snapshot without keeping the process alive. */
-    schedule_snapshot() {
-        if (this.#closed || this.#snapshot_timer) return;
-        this.#snapshot_timer = setTimeout(() => {
-            this.#snapshot_timer = undefined;
-            this.compact().catch((error) => this.#log('STATE_ERROR', error.message));
-        }, 100);
-        this.#snapshot_timer.unref?.();
-    }
-
-    /**
-     * Atomically snapshots current state and truncates the replay journal.
-     *
-     * @returns {Promise<void>}
-     */
-    compact() {
-        return this._enqueue(async () => {
-            const temporary = Path.join(this.#state_path, `.manifest-${randomUUID()}.tmp`);
-            const snapshot = {
-                version: STATE_VERSION,
-                sequence: this.#sequence,
-                active: Object.fromEntries(this.#active),
-                tombstones: [...this.#tombstones].map(([uri, value]) => ({
-                    op: 'put',
-                    uri,
-                    entry: value.entry,
-                    sequence: value.sequence,
-                })),
-            };
-            await FileSystem.writeFile(temporary, JSON.stringify(snapshot), 'utf8');
-            await FileSystem.rename(temporary, this.#manifest_path);
-            await FileSystem.writeFile(this.#ledger_path, '', 'utf8');
-            this.#journal_records = 0;
-        });
-    }
-
-    /** @returns {Promise<void>} Flushes a final snapshot and closes the store. Idempotent. */
-    async close() {
-        if (this.#closed) return;
-        if (this.#snapshot_timer) clearTimeout(this.#snapshot_timer);
-        this.#snapshot_timer = undefined;
-        try {
-            await FileSystem.access(this.#state_path);
-            await this.compact();
-        } catch (error) {
-            if (error.code !== 'ENOENT') throw error;
-        }
-        this.#closed = true;
     }
 
     /** @returns {Map<string, import('../../../index.js').Entry>} Live active-entry map. */
-    get active() {
-        return this.#active;
+    get active() { return this.#active; }
+
+    /** @returns {Array<{uri: string, entry: import('../../../index.js').TombstoneEntry}>} Tombstones in insertion order. */
+    get records() {
+        const records = [];
+        for (const { uri, entry } of this.#tombstones.values()) records.push({ uri, entry });
+        return records;
     }
 
-    /** @returns {Map<string, import('../../../index.js').TombstoneEntry>} Copy of retained tombstones in eviction order. */
+    /**
+     * Backward-compatible Map view. When both entry types were deleted at one
+     * path, the newest tombstone occupies the legacy URI key.
+     */
     get tombstones() {
-        return new Map([...this.#tombstones].map(([uri, value]) => [uri, value.entry]));
-    }
-
-    /** @returns {string} Absolute state directory. */
-    get path() {
-        return this.#state_path;
-    }
-
-    /** @returns {string} Temporary-file directory used for atomic content writes. */
-    get tmp_path() {
-        return Path.join(this.#state_path, 'tmp');
+        const output = new Map();
+        for (const { uri, entry } of this.#tombstones.values()) {
+            const current = output.get(uri);
+            if (!current || entry_timestamp(entry) > entry_timestamp(current)) output.set(uri, entry);
+        }
+        return output;
     }
 }

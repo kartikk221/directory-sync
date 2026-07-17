@@ -26,17 +26,18 @@ export interface DirectoryEntry {
 
 export interface TombstoneEntry {
     type: 'tombstone';
+    /** Filesystem type that was deleted at this path. */
     target: 'file' | 'directory';
+    /** Deletion time expressed in the Server clock domain on the wire. */
     deleted_at: number;
+    /** False when the directory itself must remain to contain a newer descendant. */
     include_self?: boolean;
 }
 
 export type Entry = FileEntry | DirectoryEntry | TombstoneEntry;
 
 export interface StateOptions {
-    /** State directory. Defaults to `.directory-sync` inside the synchronized root. */
-    path?: string;
-    /** Maximum retained tombstones. Oldest insertion is evicted first. Defaults to 10,000. */
+    /** Maximum in-memory Server tombstones. The oldest timestamp is evicted first. Defaults to 10,000. */
     max_tombstones?: number;
 }
 
@@ -76,6 +77,7 @@ export interface DirectoryMap {
     resolve(uri: string): string;
     allows(uri: string, type?: 'file' | 'directory'): boolean;
     expect(uri: string, entry: Entry, ttl?: number): void;
+    observe<T>(path: string, handler: () => T | Promise<T>): Promise<T>;
     /** Backward-compatible misspelling retained from v2. */
     supress(uri: string, event?: string, amount?: number): { amount: number; updated_at: number } | undefined;
     /** Backward-compatible suppression cleanup helper. */
@@ -90,6 +92,7 @@ export interface DirectoryMap {
     get_tombstone(uri: string): TombstoneEntry | undefined;
     canonical_entry(uri: string): Entry | undefined;
     ready(): Promise<void>;
+    settled(): Promise<void>;
     destroy(): Promise<void>;
     readonly destroyed: boolean;
     readonly path: string;
@@ -98,29 +101,29 @@ export interface DirectoryMap {
     readonly directories: Record<string, MapRecord>;
     readonly files: Record<string, MapRecord>;
     readonly supressions: Record<string, { amount: number; updated_at: number }>;
-    readonly manifest: Record<string, Entry>;
+    /** Active filesystem entries only; deletion history is exposed separately through tombstones. */
+    readonly manifest: Record<string, FileEntry | DirectoryEntry>;
+    /** In-memory deletion history. Mirrors intentionally retain no tombstones. */
+    readonly tombstones: Array<{ uri: string; entry: TombstoneEntry }>;
     readonly schema: Record<string, Array<string | number>>;
-    readonly serializable_options: Omit<DirectoryMapOptions, 'path'>;
     readonly state: StateStore;
 }
 
 export interface StateStore {
-    initialize(): Promise<void>;
     get_cached(uri: string): FileEntry | DirectoryEntry | undefined;
-    get_tombstone(uri: string): TombstoneEntry | undefined;
+    get_tombstone(uri: string, target?: 'file' | 'directory'): TombstoneEntry | undefined;
+    get_tombstone_record(uri: string, target: 'file' | 'directory'):
+        { uri: string; entry: TombstoneEntry } | undefined;
     effective_tombstone(uri: string): TombstoneEntry | undefined;
+    effective_tombstone_record(uri: string): { uri: string; entry: TombstoneEntry } | undefined;
     set_active(uri: string, entry: FileEntry | DirectoryEntry): void;
     remove_active(uri: string): void;
     remove_active_tree(uri: string): void;
     replace_active(entries: Iterable<[string, FileEntry | DirectoryEntry]>): void;
     record_tombstone(uri: string, entry: TombstoneEntry): Promise<TombstoneEntry>;
-    schedule_snapshot(): void;
-    compact(): Promise<void>;
-    close(): Promise<void>;
     readonly active: Map<string, FileEntry | DirectoryEntry>;
     readonly tombstones: Map<string, TombstoneEntry>;
-    readonly path: string;
-    readonly tmp_path: string;
+    readonly records: Array<{ uri: string; entry: TombstoneEntry }>;
 }
 
 export interface ApplyFileOptions {
@@ -189,6 +192,7 @@ export interface MirrorOptions extends DirectoryMapOptions {
     auth?: string;
     retry?: { every?: number; backoff?: boolean };
     queue?: {
+        /** Maximum active file transfers. Defaults to 100. */
         max_concurrent?: number;
         max_queued?: number;
         timeout?: number;

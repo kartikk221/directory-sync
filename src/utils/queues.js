@@ -11,6 +11,8 @@ class TaskQueue {
     #concurrency;
     #maximum;
     #pending = [];
+    #pending_offset = 0;
+    #pending_size = 0;
     #started = [];
     #started_offset = 0;
     #throttle_interval;
@@ -57,17 +59,18 @@ class TaskQueue {
      */
     run(handler, signal) {
         if (this.#closed || signal?.aborted) return Promise.reject(abort_error());
-        if (this.#active >= this.#concurrency && this.#pending.length >= this.#maximum) {
+        if (this.#active >= this.#concurrency && this.#pending_size >= this.#maximum) {
             const error = new Error('Task queue capacity was exceeded.');
             error.code = 'QUEUE_FULL';
             return Promise.reject(error);
         }
         return new Promise((resolve, reject) => {
-            const item = { handler, reject, resolve, signal, timer: undefined };
+            const item = { cancelled: false, handler, reject, resolve, signal, timer: undefined };
             if (this.#timeout !== Infinity) {
                 item.timer = setTimeout(() => {
-                    const index = this.#pending.indexOf(item);
-                    if (index !== -1) this.#pending.splice(index, 1);
+                    if (item.cancelled) return;
+                    item.cancelled = true;
+                    this.#pending_size--;
                     const error = new Error('Task queue wait timed out.');
                     error.code = 'QUEUE_TIMEOUT';
                     reject(error);
@@ -75,14 +78,22 @@ class TaskQueue {
                 item.timer.unref?.();
             }
             this.#pending.push(item);
+            this.#pending_size++;
             this._drain();
         });
     }
 
     _drain() {
-        while (!this.#closed && this.#active < this.#concurrency && this.#pending.length) {
+        while (!this.#closed && this.#active < this.#concurrency && this.#pending_size) {
             if (!this._throttle()) return;
-            const item = this.#pending.shift();
+            let item;
+            while (this.#pending_offset < this.#pending.length && !item) {
+                const candidate = this.#pending[this.#pending_offset++];
+                if (!candidate.cancelled) item = candidate;
+            }
+            if (!item) break;
+            this.#pending_size--;
+            item.cancelled = true;
             if (item.timer) clearTimeout(item.timer);
             if (item.signal?.aborted) {
                 item.reject(abort_error());
@@ -96,6 +107,10 @@ class TaskQueue {
                     this.#active--;
                     this._drain();
                 });
+        }
+        if (this.#pending_offset > 1_024 && this.#pending_offset * 2 > this.#pending.length) {
+            this.#pending = this.#pending.slice(this.#pending_offset);
+            this.#pending_offset = 0;
         }
     }
 
@@ -136,15 +151,21 @@ class TaskQueue {
         this.#closed = true;
         if (this.#throttle_timer) clearTimeout(this.#throttle_timer);
         this.#throttle_timer = undefined;
-        for (const item of this.#pending.splice(0)) {
+        for (let index = this.#pending_offset; index < this.#pending.length; index++) {
+            const item = this.#pending[index];
+            if (item.cancelled) continue;
+            item.cancelled = true;
             if (item.timer) clearTimeout(item.timer);
             item.reject(error);
         }
+        this.#pending = [];
+        this.#pending_offset = 0;
+        this.#pending_size = 0;
     }
 
     /** @returns {number} Number of tasks waiting to start. */
     get size() {
-        return this.#pending.length;
+        return this.#pending_size;
     }
 }
 

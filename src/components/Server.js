@@ -1,4 +1,5 @@
 import EventEmitter from 'node:events';
+import { randomUUID } from 'node:crypto';
 import Path from 'node:path';
 import HyperExpress from 'hyper-express';
 import DirectoryMap from './directory/DirectoryMap.js';
@@ -6,16 +7,22 @@ import DirectoryManager from './directory/DirectoryManager.js';
 import {
     ACTOR_HEADER,
     AUTH_HEADER,
+    BASE_REVISION_HEADER,
+    EPOCH_HEADER,
     HASH_HEADER,
     MODIFIED_HEADER,
     PROTOCOL_HEADER,
+    PROTOCOL_PATH,
     PROTOCOL_VERSION,
+    REVISION_HEADER,
 } from '../constants.js';
+import { KeyedQueue } from '../utils/queues.js';
 import {
     ascii_to_hex,
     canonicalize_uri,
     compare_entries,
     constant_time_equal,
+    entries_equivalent,
     is_accessible_path,
     merge_options,
     safe_json_parse,
@@ -39,17 +46,21 @@ const DEFAULT_OPTIONS = {
  * Central authority for one or more named repositories.
  *
  * Every mutation is validated against the authority's canonical entry before it
- * reaches disk. Newer mtimes win; exact ties retain the authority's entry. Once
- * committed, the canonical entry is published to subscribed mirrors.
+ * reaches disk. Matching revisions establish causal order, while timestamps
+ * resolve stale or unknown history. Committed entries receive a new revision
+ * and are published to subscribed mirrors.
  *
  * @extends EventEmitter
  */
 export default class Server extends EventEmitter {
+    #authorities = Object.create(null);
     #destroy_promise;
     #destroyed = false;
+    #epoch = randomUUID();
     #hosts = Object.create(null);
     #options;
     #ready_promise;
+    #revision = 0;
     #server;
     #websockets = new Set();
 
@@ -126,7 +137,7 @@ export default class Server extends EventEmitter {
             response.status(404).json({ code: 'INVALID_HOST', message: `Unknown synchronized host '${name || ''}'.` });
             return undefined;
         }
-        return { name, ...hosted };
+        return { name, ...hosted, authority: this.#authorities[name] };
     }
 
     _uri(request, response) {
@@ -143,8 +154,148 @@ export default class Server extends EventEmitter {
         return typeof actor === 'string' && actor.length <= 128 ? actor : 'anonymous';
     }
 
+    _next_revision() {
+        if (this.#revision >= Number.MAX_SAFE_INTEGER)
+            throw new Error('The Server authority revision limit was reached. Restart the Server to begin a new epoch.');
+        return ++this.#revision;
+    }
+
+    _tombstone_key(uri, target) {
+        return `${target}:${uri}`;
+    }
+
+    _newer_record(left, right) {
+        if (!left) return right;
+        if (!right) return left;
+        if (left.revision !== right.revision)
+            return left.revision > right.revision ? left : right;
+        return compare_entries(left.entry, right.entry) === 1 ? right : left;
+    }
+
+    _tombstone_record(hosted, uri) {
+        let selected;
+        for (const target of ['file', 'directory']) {
+            const record = hosted.map.state.get_tombstone_record(uri, target);
+            if (!record || record.entry.include_self === false) continue;
+            selected = this._newer_record(selected, {
+                ...record,
+                revision: hosted.authority.tombstones.get(this._tombstone_key(record.uri, target)) || 0,
+            });
+        }
+        let cursor = Path.posix.dirname(uri);
+        while (cursor && cursor !== '/') {
+            const record = hosted.map.state.get_tombstone_record(cursor, 'directory');
+            if (record) selected = this._newer_record(selected, {
+                ...record,
+                revision: hosted.authority.tombstones.get(this._tombstone_key(record.uri, 'directory')) || 0,
+            });
+            const parent = Path.posix.dirname(cursor);
+            cursor = parent === cursor ? '/' : parent;
+        }
+        return selected;
+    }
+
+    _authority_record(hosted, uri) {
+        const entry = hosted.map.get_entry(uri);
+        const active = entry ? {
+            uri,
+            entry,
+            revision: hosted.authority.active.get(uri) || 0,
+        } : undefined;
+        const tombstone = this._tombstone_record(hosted, uri);
+        if (
+            active &&
+            tombstone?.entry.target === 'directory' &&
+            tombstone.entry.include_self === false
+        ) return active;
+        return this._newer_record(active, tombstone);
+    }
+
+    _base_revision(request) {
+        if (request.headers[EPOCH_HEADER] !== this.#epoch) return undefined;
+        const value = request.headers[BASE_REVISION_HEADER];
+        if (value === undefined) return undefined;
+        const revision = Number(value);
+        if (!Number.isSafeInteger(revision) || revision < 0)
+            throw new TypeError('The base revision must be a non-negative safe integer.');
+        return revision;
+    }
+
+    _record_mutation(hosted, uri, entry) {
+        const revision = this._next_revision();
+        if (entry.type === 'tombstone') {
+            hosted.authority.tombstones.set(this._tombstone_key(uri, entry.target), revision);
+            if (entry.target === 'directory') {
+                for (const candidate of hosted.authority.active.keys())
+                    if (
+                        (candidate === uri || candidate.startsWith(`${uri}/`)) &&
+                        !hosted.map.get_entry(candidate)
+                    ) hosted.authority.active.delete(candidate);
+            } else if (!hosted.map.get_entry(uri)) hosted.authority.active.delete(uri);
+        } else hosted.authority.active.set(uri, revision);
+        if (hosted.authority.tombstones.size > 1_024 && revision % 1_024 === 0) {
+            const records = hosted.map.tombstones;
+            if (hosted.authority.tombstones.size > records.length * 2) {
+                const retained = new Set();
+                for (const record of records)
+                    retained.add(this._tombstone_key(record.uri, record.entry.target));
+                for (const key of hosted.authority.tombstones.keys())
+                    if (!retained.has(key)) hosted.authority.tombstones.delete(key);
+            }
+        }
+        return { uri, entry, revision };
+    }
+
+    _success(response, record) {
+        return response.json({
+            code: 'SUCCESS',
+            epoch: this.#epoch,
+            entry: record?.entry || null,
+            revision: record?.revision ?? 0,
+        });
+    }
+
+    _conflict(response, record, code = 'STALE_MUTATION') {
+        return response.status(409).json({
+            code,
+            epoch: this.#epoch,
+            entry: record?.entry || null,
+            revision: record?.revision ?? 0,
+        });
+    }
+
+    _mutate(hosted, uri, entry, request, apply) {
+        return hosted.authority.work.run(uri, async () => {
+            const current = this._authority_record(hosted, uri);
+            if (current && entries_equivalent(current.entry, entry))
+                return { accepted: false, conflict: false, record: current };
+            const base = this._base_revision(request);
+            if (
+                current?.entry.type === 'file' && entry.type === 'file' &&
+                current.entry.size === entry.size && current.entry.sha256 === entry.sha256 &&
+                base !== current.revision
+            ) return { accepted: false, conflict: false, record: current };
+            const comparison = current && base === current.revision
+                ? 1
+                : compare_entries(current?.entry, entry);
+            if (comparison < 0) return { accepted: false, conflict: true, record: current };
+            if (comparison === 0) return { accepted: false, conflict: false, record: current };
+            const validate = () => {
+                const latest = this._authority_record(hosted, uri);
+                return (!latest && !current) || (
+                    latest?.revision === current?.revision &&
+                    entries_equivalent(latest?.entry, current?.entry)
+                );
+            };
+            const applied = await apply(validate, current?.entry);
+            const record = this._record_mutation(hosted, uri, applied);
+            this._publish_mutation(hosted.name, record, this._actor(request));
+            return { accepted: true, conflict: false, record };
+        });
+    }
+
     _canonical_response(response, hosted, uri, code = 'STALE_MUTATION') {
-        return response.status(409).json({ code, entry: hosted.map.canonical_entry(uri) || null });
+        return this._conflict(response, this._authority_record(hosted, uri), code);
     }
 
     _handle_error(response, error, hosted, uri) {
@@ -178,34 +329,48 @@ export default class Server extends EventEmitter {
         this.#server.any('/', (request, response) =>
             response.status(426).json({
                 code: 'PROTOCOL_MISMATCH',
-                message: 'This server uses DirectorySync protocol v3. Upgrade both peers.',
+                message: `This server uses DirectorySync protocol v${PROTOCOL_VERSION}. Upgrade both peers.`,
             })
         );
 
-        this.#server.get('/v3/manifest', this._route(async (request, response, hosted) => {
+        this.#server.get(`${PROTOCOL_PATH}/manifest`, this._route(async (request, response, hosted) => {
             this._log('SCHEMA', `'${hosted.name}' - ${request.ip}`);
+            const manifest = hosted.map.manifest;
+            const versions = {};
+            for (const uri of Object.keys(manifest))
+                versions[uri] = hosted.authority.active.get(uri) || 0;
+            const tombstones = hosted.map.tombstones;
+            for (const record of tombstones)
+                record.revision = hosted.authority.tombstones.get(
+                    this._tombstone_key(record.uri, record.entry.target)
+                ) || 0;
             return response.json({
+                epoch: this.#epoch,
                 protocol: PROTOCOL_VERSION,
-                options: hosted.map.serializable_options,
-                manifest: hosted.map.manifest,
-                schema: hosted.map.schema,
+                server_time: Date.now(),
+                manifest,
+                tombstones,
+                versions,
             });
         }));
 
-        this.#server.get('/v3/content', this._route(async (request, response, hosted) => {
+        this.#server.get(`${PROTOCOL_PATH}/content`, this._route(async (request, response, hosted) => {
             const uri = this._uri(request, response);
             if (!uri) return;
-            const entry = hosted.map.canonical_entry(uri);
+            const record = this._authority_record(hosted, uri);
+            const entry = record?.entry;
             if (!entry) return response.status(404).json({ code: 'NOT_FOUND' });
             if (entry.type !== 'file')
                 return response.status(422).json({ code: 'NOT_A_FILE', message: 'Content routes only accept files.' });
             response.header(MODIFIED_HEADER, String(entry.modified_at));
             response.header(HASH_HEADER, entry.sha256);
+            response.header(EPOCH_HEADER, this.#epoch);
+            response.header(REVISION_HEADER, String(record?.revision ?? 0));
             response.header('content-length', String(entry.size));
             return response.stream(hosted.manager.read(uri, true), entry.size);
         }));
 
-        this.#server.put('/v3/content', this._route(async (request, response, hosted) => {
+        this.#server.put(`${PROTOCOL_PATH}/content`, this._route(async (request, response, hosted) => {
             const uri = this._uri(request, response);
             if (!uri) return;
             if (!hosted.map.allows(uri, 'file'))
@@ -219,41 +384,36 @@ export default class Server extends EventEmitter {
             validate_entry(entry);
             if (entry.size > this.#options.limits.max_body_length)
                 return response.status(413).json({ code: 'SIZE_LIMIT' });
-            const current = hosted.map.canonical_entry(uri);
-            // compare_entries is intentionally authority-oriented: a negative result
-            // means the existing server entry wins, including exact timestamp ties.
-            const comparison = compare_entries(current, entry);
-            if (comparison < 0) return this._canonical_response(response, hosted, uri);
-            if (comparison === 0) return response.json({ code: 'SUCCESS', entry: current });
-            if (
-                current?.type === 'file' &&
-                current.size === entry.size &&
-                current.sha256 === entry.sha256
-            ) await hosted.manager.apply_metadata(uri, entry);
-            else await hosted.manager.apply_file(uri, entry.size ? request : '', entry, {
-                validate_before_commit: () => compare_entries(hosted.map.canonical_entry(uri), entry) >= 0,
+            const result = await this._mutate(hosted, uri, entry, request, async (validate, current) => {
+                if (
+                    current?.type === 'file' &&
+                    current.size === entry.size &&
+                    current.sha256 === entry.sha256
+                ) return (await hosted.manager.apply_metadata(uri, entry)).entry;
+                return (await hosted.manager.apply_file(uri, entry.size ? request : '', entry, {
+                    validate_before_commit: validate,
+                })).entry;
             });
-            this._publish_mutation(hosted.name, uri, entry, this._actor(request));
-            return response.json({ code: 'SUCCESS', entry });
+            return result.conflict
+                ? this._conflict(response, result.record)
+                : this._success(response, result.record);
         }));
 
-        this.#server.patch('/v3/content', this._route(async (request, response, hosted) => {
+        this.#server.patch(`${PROTOCOL_PATH}/content`, this._route(async (request, response, hosted) => {
             const uri = this._uri(request, response);
             if (!uri) return;
             const entry = await request.json();
             validate_entry(entry);
             if (entry.type !== 'file') throw new TypeError('Expected a file entry.');
-            const current = hosted.map.canonical_entry(uri);
-            const comparison = compare_entries(current, entry);
-            if (comparison < 0) return this._canonical_response(response, hosted, uri);
-            if (comparison > 0) {
-                await hosted.manager.apply_metadata(uri, entry);
-                this._publish_mutation(hosted.name, uri, entry, this._actor(request));
-            }
-            return response.json({ code: 'SUCCESS', entry });
+            const result = await this._mutate(hosted, uri, entry, request, async () =>
+                (await hosted.manager.apply_metadata(uri, entry)).entry
+            );
+            return result.conflict
+                ? this._conflict(response, result.record)
+                : this._success(response, result.record);
         }));
 
-        this.#server.put('/v3/directory', this._route(async (request, response, hosted) => {
+        this.#server.put(`${PROTOCOL_PATH}/directory`, this._route(async (request, response, hosted) => {
             const uri = this._uri(request, response);
             if (!uri) return;
             if (!hosted.map.allows(uri, 'directory'))
@@ -261,16 +421,15 @@ export default class Server extends EventEmitter {
             const entry = await request.json();
             validate_entry(entry);
             if (entry.type !== 'directory') throw new TypeError('Expected a directory entry.');
-            const comparison = compare_entries(hosted.map.canonical_entry(uri), entry);
-            if (comparison < 0) return this._canonical_response(response, hosted, uri);
-            if (comparison > 0) {
-                await hosted.manager.apply_directory(uri, entry);
-                this._publish_mutation(hosted.name, uri, entry, this._actor(request));
-            }
-            return response.json({ code: 'SUCCESS', entry });
+            const result = await this._mutate(hosted, uri, entry, request, async () =>
+                (await hosted.manager.apply_directory(uri, entry)).entry
+            );
+            return result.conflict
+                ? this._conflict(response, result.record)
+                : this._success(response, result.record);
         }));
 
-        this.#server.delete('/v3/entry', this._route(async (request, response, hosted) => {
+        this.#server.delete(`${PROTOCOL_PATH}/entry`, this._route(async (request, response, hosted) => {
             const uri = this._uri(request, response);
             if (!uri) return;
             const entry = await request.json();
@@ -278,15 +437,15 @@ export default class Server extends EventEmitter {
             if (entry.type !== 'tombstone') throw new TypeError('Expected a tombstone entry.');
             if (!hosted.map.allows(uri, entry.target))
                 return response.status(422).json({ code: 'FILTERED', message: 'The authority filters this entry.' });
-            const comparison = compare_entries(hosted.map.canonical_entry(uri), entry);
-            if (comparison < 0) return this._canonical_response(response, hosted, uri);
-            if (comparison === 0) return response.json({ code: 'SUCCESS', entry });
-            const applied = await hosted.manager.apply_tombstone(uri, entry);
-            this._publish_mutation(hosted.name, uri, applied, this._actor(request));
-            return response.json({ code: 'SUCCESS', entry: applied });
+            const result = await this._mutate(hosted, uri, entry, request, () =>
+                hosted.manager.apply_tombstone(uri, entry)
+            );
+            return result.conflict
+                ? this._conflict(response, result.record)
+                : this._success(response, result.record);
         }));
 
-        this.#server.ws('/v3/events', (ws) => {
+        this.#server.ws(`${PROTOCOL_PATH}/events`, (ws) => {
             this.#websockets.add(ws);
             this._log('WEBSOCKET', `CONNECTED - ${ws.ip}`);
             ws.on('message', (raw) => {
@@ -309,17 +468,26 @@ export default class Server extends EventEmitter {
                 this._log('WEBSOCKET', `DISCONNECTED - ${ws.ip}`);
             });
         });
-        this.#server.upgrade('/v3/events', (request, response) => {
+        this.#server.upgrade(`${PROTOCOL_PATH}/events`, (request, response) => {
             if (!this._protocol(request, response)) return;
             return response.upgrade({ actor: this._actor(request) });
         });
     }
 
-    _publish_mutation(host, uri, entry, actor = 'server') {
+    _publish_mutation(host, record, actor = 'server') {
         if (!this.#hosts[host]) return;
         this.#server.publish(
             `events/${ascii_to_hex(host)}`,
-            JSON.stringify({ command: 'MUTATION', protocol: PROTOCOL_VERSION, host, uri, entry, actor })
+            JSON.stringify({
+                command: 'MUTATION',
+                protocol: PROTOCOL_VERSION,
+                epoch: this.#epoch,
+                host,
+                uri: record.uri,
+                entry: record.entry,
+                revision: record.revision,
+                actor,
+            })
         );
     }
 
@@ -355,9 +523,20 @@ export default class Server extends EventEmitter {
             this._log('SIZE_LIMIT_REACHED', `${uri} - SIZE_${record.stats.size}_BYTES`)
         );
         await map.ready();
-        map.on('mutation', (uri, entry) => this._publish_mutation(name, uri, entry, 'server'));
-        this.#hosts[name] = { path: root, map, manager };
-        return this.#hosts[name];
+        const hosted = { path: root, map, manager };
+        const authority = {
+            active: new Map(),
+            tombstones: new Map(),
+            work: new KeyedQueue(),
+        };
+        const internal = { name, ...hosted, authority };
+        map.on('mutation', (uri, entry) => {
+            const record = this._record_mutation(internal, uri, entry);
+            this._publish_mutation(name, record, 'server');
+        });
+        this.#authorities[name] = authority;
+        this.#hosts[name] = hosted;
+        return hosted;
     }
 
     /**
@@ -369,7 +548,11 @@ export default class Server extends EventEmitter {
     async unhost(name) {
         const hosted = this.#hosts[name];
         if (!hosted) return false;
+        const authority = this.#authorities[name];
         delete this.#hosts[name];
+        delete this.#authorities[name];
+        authority.work.close();
+        await authority.work.idle();
         await hosted.map.destroy();
         return true;
     }
@@ -396,7 +579,9 @@ export default class Server extends EventEmitter {
             await this.#server.shutdown();
             for (const websocket of this.#websockets) websocket.close(1001, 'Server shutting down');
             this.#websockets.clear();
-            await Promise.all(Object.keys(this.#hosts).map((name) => this.unhost(name)));
+            const hosts = [];
+            for (const name of Object.keys(this.#hosts)) hosts.push(this.unhost(name));
+            await Promise.all(hosts);
         })();
         return this.#destroy_promise;
     }
