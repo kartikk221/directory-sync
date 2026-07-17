@@ -719,24 +719,29 @@ export default class Mirror extends EventEmitter {
             versions: remote_state.versions,
         };
         const actions = await this._plan(remote, this.#map.manifest);
-        const perform = (action) => this._schedule(action.uri, () => {
-            if (action.direction === 'adopt') {
-                this._adopt_revision(
-                    action.uri,
-                    action.record.entry,
-                    action.record.revision,
-                    remote_state.epoch
-                );
-                return;
+        const perform = (action) => this._schedule(action.uri, async () => {
+            try {
+                if (action.direction === 'adopt') {
+                    this._adopt_revision(
+                        action.uri,
+                        action.record.entry,
+                        action.record.revision,
+                        remote_state.epoch
+                    );
+                } else if (action.direction === 'pull') {
+                    await this._apply_remote(
+                        action.uri,
+                        action.record.entry,
+                        action.record.revision,
+                        remote_state.epoch
+                    );
+                } else await this._push_local(action.uri, action.entry, action.other);
+                return true;
+            } catch (error) {
+                if (error.code !== 'FILTERED') throw error;
+                this._log('FILTERED', `${action.uri} - rejected by authority filter`);
+                return false;
             }
-            return action.direction === 'pull'
-                ? this._apply_remote(
-                    action.uri,
-                    action.record.entry,
-                    action.record.revision,
-                    remote_state.epoch
-                )
-                : this._push_local(action.uri, action.entry, action.other);
         });
         // Tombstones go first to remove stale type conflicts, directories create
         // parents for files, and a final deepest-first directory metadata pass
@@ -748,12 +753,14 @@ export default class Mirror extends EventEmitter {
             else if (action.type === 'tombstone') await perform(action);
             else if (action.type === 'directory') directories.push(action);
             else files.push(action);
-        for (const action of directories) await perform(action);
+        const applied_directories = [];
+        for (const action of directories)
+            if (await perform(action)) applied_directories.push(action);
         const transfers = [];
         for (const action of files) transfers.push(perform(action));
         await Promise.all(transfers);
-        directories.sort((left, right) => right.depth - left.depth);
-        for (const action of directories) await perform(action);
+        applied_directories.sort((left, right) => right.depth - left.depth);
+        for (const action of applied_directories) await perform(action);
     }
 
     /**

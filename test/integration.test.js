@@ -60,9 +60,11 @@ async function create_mirror(t, root, port) {
         watcher: WATCHER,
     });
     const errors = capture_errors(mirror);
+    const logs = [];
+    mirror.on('log', (code, message) => logs.push([code, message]));
     t.after(() => mirror.destroy());
     await mirror.ready();
-    return { errors, mirror };
+    return { errors, logs, mirror };
 }
 
 test('HyperExpress v7 routes enforce auth/protocol and stream exact file content', async (t) => {
@@ -273,6 +275,45 @@ test('server rejects malformed, oversized, stale, and filtered mutations', async
     assert.equal(response.status, 422);
     assert.equal((await response.json()).code, 'FILTERED');
     assert.deepEqual(errors, []);
+});
+
+test('Mirror skips authority-filtered paths without aborting transfers or logs', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-filter-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-filter-mirror-');
+    await write_file(server_root, '/download.txt', 'download');
+    await write_file(mirror_root, '/allowed.txt', 'allowed');
+    await write_file(mirror_root, '/blocked/rejected.txt', 'blocked');
+    const port = await available_port();
+    const server = new Server({ port, auth: 'secret' });
+    const server_errors = capture_errors(server);
+    t.after(() => server.destroy());
+    await server.ready();
+    await server.host('repository', server_root, {
+        watcher: WATCHER,
+        filters: { ignore: { directories: ['blocked'] } },
+    });
+
+    const { errors, logs } = await create_mirror(t, mirror_root, port);
+    assert.equal(await read_if_exists(Path.join(server_root, 'allowed.txt')), 'allowed');
+    assert.equal(await read_if_exists(Path.join(mirror_root, 'download.txt')), 'download');
+    assert.equal(await read_if_exists(Path.join(server_root, 'blocked/rejected.txt')), undefined);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'UPLOAD' && message === '/allowed.txt - FILE - START'
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'UPLOAD' && message.startsWith('/allowed.txt - FILE - COMPLETE - ')
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'DOWNLOAD' && message === '/download.txt - FILE - START'
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'DOWNLOAD' && message.startsWith('/download.txt - FILE - COMPLETE - ')
+    ), true);
+    assert.equal(logs.some(([code, message]) =>
+        code === 'FILTERED' && message.startsWith('/blocked')
+    ), true);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(server_errors, []);
 });
 
 test('server authority converges two mirrors with newest-mtime conflict resolution and tombstones', async (t) => {
