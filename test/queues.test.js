@@ -19,6 +19,10 @@ test('TaskQueue bounds concurrency and allows work with max_queued zero', async 
     await assert.rejects(task(), { code: 'QUEUE_FULL' });
     await Promise.all([first, second]);
     assert.equal(maximum, 2);
+
+    const serial = new TaskQueue({ concurrency: 1, maximum: 0 });
+    await serial.run(() => undefined);
+    await serial.run(() => undefined);
 });
 
 test('TaskQueue times out queued work and rejects work after close', async () => {

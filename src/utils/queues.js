@@ -102,10 +102,14 @@ class TaskQueue {
             this.#active++;
             Promise.resolve()
                 .then(item.handler)
-                .then(item.resolve, item.reject)
-                .finally(() => {
+                .then((value) => {
                     this.#active--;
                     this._drain();
+                    item.resolve(value);
+                }, (error) => {
+                    this.#active--;
+                    this._drain();
+                    item.reject(error);
                 });
         }
         if (this.#pending_offset > 1_024 && this.#pending_offset * 2 > this.#pending.length) {

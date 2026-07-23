@@ -39,6 +39,7 @@ const DEFAULT_OPTIONS = {
     queue: {
         max_concurrent: 100,
         max_queued: Infinity,
+        max_pending: 10_000,
         timeout: Infinity,
         throttle: { rate: Infinity, interval: Infinity },
     },
@@ -125,9 +126,10 @@ class PooledWebsocket {
                 [ACTOR_HEADER]: `pool-${this.#identity.slice(-16)}`,
             },
         });
-        const connected = new Set();
+        let opened = false;
         this.#socket = socket;
         socket.on('open', () => {
+            opened = true;
             const reconnect = this.#ever_opened;
             this.#ever_opened = true;
             this.#attempt = 0;
@@ -140,10 +142,8 @@ class PooledWebsocket {
                 const pending = this.#pending_subscriptions.get(message.host);
                 this.#pending_subscriptions.delete(message.host);
                 for (const [mirror, reconnect] of pending || []) {
-                    if (this.#subscriptions.get(message.host)?.has(mirror)) {
-                        connected.add(mirror);
+                    if (this.#subscriptions.get(message.host)?.has(mirror))
                         mirror._on_socket_ready(reconnect);
-                    }
                 }
                 return;
             }
@@ -157,8 +157,8 @@ class PooledWebsocket {
         socket.on('close', () => {
             if (this.#socket === socket) this.#socket = undefined;
             this.#pending_subscriptions.clear();
-            for (const mirror of connected)
-                if (this.#subscriptions.get(mirror.host)?.has(mirror)) mirror._on_socket_close();
+            if (opened)
+                for (const mirror of this._all_mirrors()) mirror._on_socket_close();
             if (this.#closed || !this.#subscriptions.size) return;
             const retry = this.#options.retry;
             const base = retry.backoff ? retry.every * 2 ** this.#attempt++ : retry.every;
@@ -234,6 +234,31 @@ function yield_event_loop() {
     return new Promise((resolve) => setImmediate(resolve));
 }
 
+async function run_bounded(items, concurrency, handler) {
+    if (!items.length) return;
+    let cursor = 0;
+    let failed = false;
+    let failure;
+    const worker = async () => {
+        while (cursor < items.length) {
+            const index = cursor++;
+            try {
+                await handler(items[index], index);
+            } catch (error) {
+                if (!failed) {
+                    failed = true;
+                    failure = error;
+                }
+            }
+        }
+    };
+    const workers = [];
+    const count = Math.min(concurrency, items.length);
+    for (let index = 0; index < count; index++) workers.push(worker());
+    await Promise.all(workers);
+    if (failed) throw failure;
+}
+
 /**
  * Bidirectional repository node backed by a Server authority.
  *
@@ -253,14 +278,18 @@ export default class Mirror extends EventEmitter {
     #destroy_promise;
     #destroyed = false;
     #epoch;
-    #event_chain = Promise.resolve();
+    #event_pump_promise;
+    #event_reconcile_needed = false;
+    #event_wake_promise;
+    #event_wake_resolve;
     #host;
     #initialized = false;
     #initial_remote_promise;
     #manager;
     #map;
+    #mutation_sequence = 0;
     #options;
-    #pending_mutations = [];
+    #pending_mutations = new Map();
     #pool;
     #ready_promise;
     #reconcile_again = false;
@@ -293,6 +322,8 @@ export default class Mirror extends EventEmitter {
             throw new TypeError('Mirror port must be an integer between 1 and 65535.');
         if (!Number.isFinite(this.#options.retry.every) || this.#options.retry.every < 0)
             throw new TypeError('retry.every must be a non-negative number.');
+        if (!Number.isSafeInteger(this.#options.queue.max_pending) || this.#options.queue.max_pending < 1)
+            throw new TypeError('queue.max_pending must be a positive safe integer.');
         this.#transfer_queue = new TaskQueue({
             concurrency: this.#options.queue.max_concurrent,
             maximum: this.#options.queue.max_queued,
@@ -335,9 +366,6 @@ export default class Mirror extends EventEmitter {
         this.#map = new DirectoryMap(map_options);
         this.#manager = new DirectoryManager(this.#map, true);
         this.#map.on('error', (error) => this._emit_error(error));
-        this.#map.on('file_size_limit', (uri, record) =>
-            this._log('SIZE_LIMIT_REACHED', `${uri} - SIZE_${record.stats.size}_BYTES`)
-        );
 
         const identity = pool_identity(this.#options);
         this.#pool = websocket_pool.get(identity);
@@ -350,9 +378,9 @@ export default class Mirror extends EventEmitter {
         const remote = await this.#initial_remote_promise;
         await this._perform_hard_sync(remote);
         await this.#map.settled();
-        this.#map.on('mutation', (uri, entry, previous) => this._handle_local_mutation(uri, entry, previous));
+        this.#map.on('mutation', (uri, entry) => this._handle_local_mutation(uri, entry));
         this.#initialized = true;
-        for (const message of this.#pending_mutations.splice(0)) this._receive_mutation(message);
+        this._start_event_pump();
         return this;
     }
 
@@ -486,7 +514,7 @@ export default class Mirror extends EventEmitter {
     async _apply_remote(uri, entry, revision, epoch = this.#epoch) {
         validate_entry(entry);
         if (epoch !== this.#epoch) {
-            this._perform_hard_sync().catch((error) => this._emit_error(error));
+            this._request_reconciliation();
             return;
         }
         if (!Number.isSafeInteger(revision) || revision < 0)
@@ -506,31 +534,18 @@ export default class Mirror extends EventEmitter {
             return;
         }
         if (entry.type === 'directory') {
-            const started = Date.now();
             await this.#manager.apply_directory(uri, localized);
             this._adopt_revision(uri, entry, revision, epoch);
-            if (local?.type !== 'directory') {
-                if (local?.type === 'file')
-                    this._log('DELETE', `${uri} - FILE - ${Date.now() - started}ms`);
-                this._log('CREATE', `${uri} - DIRECTORY - ${Date.now() - started}ms`);
-            }
             return;
         }
         if (entry.type === 'tombstone') {
-            const started = Date.now();
-            const before = entry.target === 'directory'
-                ? Object.keys(this.#map.active_entries_under(uri)).length
-                : Number(local?.type === 'file');
             await this.#manager.apply_tombstone(uri, localized);
             this._adopt_revision(uri, entry, revision, epoch);
-            const after = entry.target === 'directory'
-                ? Object.keys(this.#map.active_entries_under(uri)).length
-                : Number(this.#map.canonical_entry(uri)?.type === 'file');
-            if (after < before)
-                this._log('DELETE', `${uri} - ${entry.target.toUpperCase()} - ${Date.now() - started}ms`);
             return;
         }
 
+        const start = Date.now();
+        this._log('DOWNLOAD', `${uri} - FILE - START`);
         const response = await this._request('GET', `${PROTOCOL_PATH}/content`, { uri });
         if (response.status === 404) return;
         const actual_epoch = response.headers.get(EPOCH_HEADER);
@@ -547,11 +562,9 @@ export default class Mirror extends EventEmitter {
             !Number.isSafeInteger(actual_revision) || actual_revision < revision
         ) {
             await response.body?.cancel();
-            this._perform_hard_sync().catch((error) => this._emit_error(error));
+            this._request_reconciliation();
             return;
         }
-        const start = Date.now();
-        this._log('DOWNLOAD', `${uri} - FILE - START`);
         const actual_local = this._localize_remote(actual);
         await this.#manager.apply_file(uri, response.body, actual_local, {
             validate_before_commit: () => {
@@ -560,15 +573,10 @@ export default class Mirror extends EventEmitter {
             },
         });
         this._adopt_revision(uri, actual, actual_revision, actual_epoch);
-        if (local?.type !== 'file') {
-            if (local?.type === 'directory')
-                this._log('DELETE', `${uri} - DIRECTORY - ${Date.now() - start}ms`);
-            this._log('CREATE', `${uri} - FILE - ${Date.now() - start}ms`);
-        }
         this._log('DOWNLOAD', `${uri} - FILE - COMPLETE - ${Date.now() - start}ms`);
     }
 
-    async _push_local(uri, entry, remote, previous = remote?.entry) {
+    async _push_local(uri, entry, remote) {
         if (!entry) return;
         validate_entry(entry);
         const type = entry.type === 'tombstone' ? entry.target : entry.type;
@@ -588,7 +596,6 @@ export default class Mirror extends EventEmitter {
         const wire_entry = this._normalize_local(entry);
         const remote_entry = remote?.entry;
         const headers = this._revision_headers(uri, remote?.revision);
-        const mutation_started = Date.now();
         let response;
         if (entry.type === 'directory') {
             response = await this._request('PUT', `${PROTOCOL_PATH}/directory`, {
@@ -632,7 +639,7 @@ export default class Mirror extends EventEmitter {
             payload.epoch !== this.#epoch ||
             !Number.isSafeInteger(payload.revision) || payload.revision < 0
         ) {
-            this._perform_hard_sync().catch((error) => this._emit_error(error));
+            this._request_reconciliation();
             return;
         }
         if (response.status === 409) {
@@ -642,17 +649,7 @@ export default class Mirror extends EventEmitter {
         }
         if (payload.entry && !entries_equivalent(payload.entry, wire_entry))
             await this._apply_remote(uri, payload.entry, payload.revision, payload.epoch);
-        else {
-            this._adopt_revision(uri, payload.entry, payload.revision, payload.epoch);
-            if (entry.type === 'tombstone') {
-                if (previous && previous.type !== 'tombstone')
-                    this._log('DELETE', `${uri} - ${entry.target.toUpperCase()} - ${Date.now() - mutation_started}ms`);
-            } else if (previous?.type !== entry.type) {
-                if (previous && previous.type !== 'tombstone')
-                    this._log('DELETE', `${uri} - ${previous.type.toUpperCase()} - ${Date.now() - mutation_started}ms`);
-                this._log('CREATE', `${uri} - ${entry.type.toUpperCase()} - ${Date.now() - mutation_started}ms`);
-            }
-        }
+        else this._adopt_revision(uri, payload.entry, payload.revision, payload.epoch);
     }
 
     async _plan(remote, local) {
@@ -803,9 +800,7 @@ export default class Mirror extends EventEmitter {
         const applied_directories = [];
         for (const action of directories)
             if (await perform(action)) applied_directories.push(action);
-        const transfers = [];
-        for (const action of files) transfers.push(perform(action));
-        await Promise.all(transfers);
+        await run_bounded(files, this.#options.queue.max_concurrent, perform);
         applied_directories.sort((left, right) => right.depth - left.depth);
         for (const action of applied_directories) await perform(action);
     }
@@ -823,43 +818,205 @@ export default class Mirror extends EventEmitter {
             return this.#reconcile_promise;
         }
         this.#reconcile_promise = (async () => {
-            const started = Date.now();
             await this._reconcile_once(state);
             while (this.#reconcile_again && !this.#destroyed) {
                 this.#reconcile_again = false;
                 await this._reconcile_once();
             }
-            this._log('MANIFEST', `${this.#host} - SYNC COMPLETE - ${Date.now() - started}ms`);
         })().finally(() => {
             this.#reconcile_promise = undefined;
         });
         return this.#reconcile_promise;
     }
 
-    _handle_local_mutation(uri, entry, previous) {
+    _handle_local_mutation(uri, entry) {
         const type = entry.type === 'tombstone' ? entry.target : entry.type;
         if (!this.#authority_allows(uri, type)) return;
-        this._schedule(uri, () => this._push_local(uri, entry, undefined, previous))
-            .catch((error) => {
-                if (error.code === 'FILTERED') return;
-                if (!this.#destroyed) this._emit_error(error);
+        this._enqueue_mutation({ entry, remote: false, uri });
+    }
+
+    _request_reconciliation() {
+        if (this.#destroyed) return;
+        this.#event_reconcile_needed = true;
+        this._wake_event_pump();
+        this._start_event_pump();
+    }
+
+    _enqueue_mutation(mutation) {
+        const previous = this.#pending_mutations.get(mutation.uri);
+        if (previous?.remote && mutation.remote && previous.epoch === mutation.epoch) {
+            if (previous.revision > mutation.revision) {
+                this._request_reconciliation();
+                return;
+            }
+            if (previous.revision === mutation.revision) {
+                if (!entries_equivalent(previous.entry, mutation.entry))
+                    this._request_reconciliation();
+                return;
+            }
+        }
+        if (!previous && this.#pending_mutations.size >= this.#options.queue.max_pending) {
+            // The manifest is the source of truth. Discarding the bounded inbox
+            // and reconciling is safer and cheaper than retaining an unbounded
+            // promise/task backlog during a filesystem burst.
+            this.#pending_mutations.clear();
+            this.#event_reconcile_needed = true;
+        } else {
+            mutation.sequence = this.#mutation_sequence++;
+            this.#pending_mutations.set(mutation.uri, mutation);
+        }
+        this._wake_event_pump();
+        this._start_event_pump();
+    }
+
+    _wake_event_pump() {
+        this.#event_wake_resolve?.();
+        this.#event_wake_promise = undefined;
+        this.#event_wake_resolve = undefined;
+    }
+
+    _event_wakeup() {
+        if (!this.#event_wake_promise)
+            this.#event_wake_promise = new Promise((resolve) => {
+                this.#event_wake_resolve = resolve;
             });
+        return this.#event_wake_promise;
+    }
+
+    _start_event_pump() {
+        if (
+            !this.#initialized || this.#destroyed || this.#event_pump_promise ||
+            (!this.#event_reconcile_needed && !this.#pending_mutations.size)
+        ) return;
+        const pump = this._drain_mutations();
+        this.#event_pump_promise = pump;
+        pump.catch((error) => {
+            if (!this.#destroyed) this._emit_error(error);
+        }).finally(() => {
+            if (this.#event_pump_promise === pump) this.#event_pump_promise = undefined;
+            if (
+                !this.#destroyed &&
+                (this.#event_reconcile_needed || this.#pending_mutations.size)
+            ) this._start_event_pump();
+        });
+    }
+
+    async _drain_mutations() {
+        while (!this.#destroyed) {
+            if (this.#event_reconcile_needed) {
+                this.#event_reconcile_needed = false;
+                this.#pending_mutations.clear();
+                await this._perform_hard_sync();
+                continue;
+            }
+            if (!this.#pending_mutations.size) return;
+            const next = [...this.#pending_mutations.values()]
+                .sort((left, right) => left.sequence - right.sequence)[0];
+            try {
+                if (this._is_leaf_mutation(next)) await this._drain_leaf_mutations();
+                else {
+                    this.#pending_mutations.delete(next.uri);
+                    await this._apply_mutation(next);
+                }
+            } catch (error) {
+                if (error.code === 'FILTERED') continue;
+                if (!this.#destroyed) this._emit_error(error);
+                this.#event_reconcile_needed = true;
+            }
+        }
+    }
+
+    _is_leaf_mutation(mutation) {
+        return mutation.entry?.type === 'file' || (
+            mutation.entry?.type === 'tombstone' && mutation.entry.target === 'file'
+        );
+    }
+
+    _apply_mutation(mutation) {
+        return this._schedule(mutation.uri, () =>
+            mutation.remote
+                ? this._apply_remote(
+                    mutation.uri,
+                    mutation.entry,
+                    mutation.revision,
+                    mutation.epoch
+                )
+                : this._push_local(mutation.uri, mutation.entry)
+        );
+    }
+
+    _take_leaf_mutations(limit, active_uris) {
+        const ordered = [...this.#pending_mutations.values()]
+            .sort((left, right) => left.sequence - right.sequence);
+        const leaves = [];
+        for (const mutation of ordered) {
+            if (!this._is_leaf_mutation(mutation)) break;
+            if (active_uris.has(mutation.uri)) continue;
+            this.#pending_mutations.delete(mutation.uri);
+            leaves.push(mutation);
+            if (leaves.length === limit) break;
+        }
+        return leaves;
+    }
+
+    async _drain_leaf_mutations() {
+        const active = new Set();
+        const active_uris = new Set();
+        let failed = false;
+        let failure;
+        const launch = (mutation) => {
+            active_uris.add(mutation.uri);
+            const task = Promise.resolve()
+                .then(() => this._apply_mutation(mutation))
+                .catch((error) => {
+                    if (error.code === 'FILTERED') return;
+                    if (!failed) {
+                        failed = true;
+                        failure = error;
+                    }
+                })
+                .finally(() => {
+                    active.delete(task);
+                    active_uris.delete(mutation.uri);
+                });
+            active.add(task);
+        };
+        while (!this.#destroyed) {
+            if (this.#event_reconcile_needed) break;
+            const available = this.#options.queue.max_concurrent - active.size;
+            if (available > 0)
+                for (const mutation of this._take_leaf_mutations(available, active_uris))
+                    launch(mutation);
+            if (!active.size) break;
+            if (active.size < this.#options.queue.max_concurrent)
+                await Promise.race([...active, this._event_wakeup()]);
+            else await Promise.race(active);
+        }
+        await Promise.all(active);
+        if (failed) throw failure;
     }
 
     /** @protected @param {object} message Protocol mutation event. @returns {void} */
     _receive_mutation(message) {
         if (message.actor === this.#actor || this.#destroyed) return;
-        if (!this.#initialized) {
-            this.#pending_mutations.push(message);
+        if (
+            typeof message.uri !== 'string' || !message.uri ||
+            typeof message.epoch !== 'string' || !message.epoch ||
+            !Number.isSafeInteger(message.revision) || message.revision < 0
+        ) {
+            this._request_reconciliation();
             return;
         }
-        this.#event_chain = this.#event_chain
-            .catch(() => undefined)
-            .then(() => this._schedule(message.uri, () =>
-                this._apply_remote(message.uri, message.entry, message.revision, message.epoch)
-            ));
-        this.#event_chain.catch((error) => {
-            if (!this.#destroyed) this._emit_error(error);
+        if (this.#epoch && message.epoch !== this.#epoch) {
+            this._request_reconciliation();
+            return;
+        }
+        this._enqueue_mutation({
+            entry: message.entry,
+            epoch: message.epoch,
+            remote: true,
+            revision: message.revision,
+            uri: message.uri,
         });
     }
 
@@ -871,7 +1028,7 @@ export default class Mirror extends EventEmitter {
             this.#socket_ready_resolve();
             return;
         }
-        this._perform_hard_sync().catch((error) => this._emit_error(error));
+        this._request_reconciliation();
     }
 
     /** @protected @returns {void} */
@@ -899,10 +1056,12 @@ export default class Mirror extends EventEmitter {
         this.#abort_controller.abort();
         this.#transfer_queue.close();
         this.#work.close();
+        this._wake_event_pump();
         this.#pool?.remove(this);
         this.#destroy_promise = (async () => {
             await this.#ready_promise.catch(() => undefined);
-            await this.#event_chain.catch(() => undefined);
+            await this.#event_pump_promise?.catch(() => undefined);
+            this.#pending_mutations.clear();
             await this.#work.idle();
             await this.#map?.destroy();
             this.removeAllListeners();

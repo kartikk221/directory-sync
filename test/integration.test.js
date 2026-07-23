@@ -52,7 +52,7 @@ async function create_server(t, root, options = {}) {
     return { errors, logs, port, server };
 }
 
-async function create_mirror(t, root, port) {
+async function create_mirror(t, root, port, options = {}) {
     const mirror = new Mirror('repository', {
         path: root,
         hostname: '127.0.0.1',
@@ -60,6 +60,7 @@ async function create_mirror(t, root, port) {
         auth: 'secret',
         retry: { every: 20, backoff: false },
         watcher: WATCHER,
+        ...options,
     });
     const errors = capture_errors(mirror);
     const logs = [];
@@ -140,13 +141,9 @@ test('HyperExpress v7 routes enforce auth/protocol and stream exact file content
         code === 'DOWNLOAD' &&
         message.includes("'repository' - /uploaded.bin - FILE - 3 BYTES - COMPLETE - ")
     ), true);
-    assert.equal(logs.some(([code, message]) =>
-        code === 'CREATE' &&
-        /'repository' - \/uploaded\.bin - FILE - \d+ms$/.test(message)
-    ), true);
     assert.equal(logs.some(([code]) => code === 'MANIFEST'), true);
     assert.equal(logs.every(([code]) =>
-        ['UPLOAD', 'DOWNLOAD', 'CREATE', 'DELETE', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
+        ['UPLOAD', 'DOWNLOAD', 'MANIFEST', 'WEBSOCKET'].includes(code)
     ), true);
     assert.deepEqual(errors, []);
 });
@@ -256,6 +253,351 @@ test('a Server restart creates a new epoch and Mirrors converge new mutations', 
     assert.deepEqual(replacement_errors, []);
 });
 
+test('live Server file bursts download concurrently through the Mirror transfer queue', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-live-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-live-mirror-');
+    const server_record = await create_server(t, server_root);
+    const mirror_record = await create_mirror(t, mirror_root, server_record.port);
+    const targets = new Set(['/parallel-a.txt', '/parallel-b.txt']);
+    const original_fetch = globalThis.fetch;
+    const requests = [];
+    let release_first;
+    let overlapped = false;
+    const first_gate = new Promise((resolve) => {
+        release_first = resolve;
+    });
+    globalThis.fetch = async (input, options) => {
+        const url = new URL(input);
+        const uri = url.searchParams.get('uri');
+        if (
+            (options?.method || 'GET') === 'GET' &&
+            url.pathname === `${PROTOCOL_PATH}/content` &&
+            targets.has(uri)
+        ) {
+            requests.push(uri);
+            if (requests.length === 1) {
+                await Promise.race([
+                    first_gate,
+                    wait(750, undefined, { ref: false }),
+                ]);
+            } else {
+                overlapped = true;
+                release_first();
+            }
+        }
+        return original_fetch(input, options);
+    };
+    t.after(() => {
+        release_first();
+        globalThis.fetch = original_fetch;
+    });
+
+    const modified_at = Date.now();
+    await Promise.all([
+        write_file(server_root, '/parallel-a.txt', 'alpha', modified_at),
+        write_file(server_root, '/parallel-b.txt', 'bravo', modified_at + 1),
+    ]);
+    await wait_for(async () =>
+        (await read_if_exists(Path.join(mirror_root, 'parallel-a.txt'))) === 'alpha' &&
+        (await read_if_exists(Path.join(mirror_root, 'parallel-b.txt'))) === 'bravo'
+    );
+
+    assert.equal(overlapped, true);
+    assert.deepEqual(new Set(requests), targets);
+    assert.deepEqual(mirror_record.errors, []);
+    assert.deepEqual(server_record.errors, []);
+});
+
+test('live mutations coalesce to the newest pending revision for each URI', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-coalesce-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-coalesce-mirror-');
+    const server_record = await create_server(t, server_root);
+    const mirror_record = await create_mirror(t, mirror_root, server_record.port, {
+        queue: { max_concurrent: 2, max_pending: 2 },
+    });
+    const response = await fetch(endpoint(server_record.port, `${PROTOCOL_PATH}/manifest`), {
+        headers: headers(),
+    });
+    const { epoch } = await response.json();
+    const empty = {
+        type: 'file',
+        modified_at: Date.now(),
+        size: 0,
+        sha256: sha256(''),
+    };
+    const applied = [];
+    let release_block;
+    let signal_block;
+    const block_gate = new Promise((resolve) => {
+        release_block = resolve;
+    });
+    const block_started = new Promise((resolve) => {
+        signal_block = resolve;
+    });
+    mirror_record.mirror._apply_remote = async (uri, entry, revision) => {
+        if (uri === '/block.txt') {
+            signal_block();
+            await block_gate;
+        } else applied.push([uri, entry.modified_at, revision]);
+    };
+    t.after(() => release_block());
+
+    mirror_record.mirror._receive_mutation({
+        actor: 'synthetic',
+        command: 'MUTATION',
+        entry: empty,
+        epoch,
+        host: 'repository',
+        protocol: PROTOCOL_VERSION,
+        revision: 1,
+        uri: '/block.txt',
+    });
+    await block_started;
+    for (let revision = 2; revision <= 101; revision++) {
+        mirror_record.mirror._receive_mutation({
+            actor: 'synthetic',
+            command: 'MUTATION',
+            entry: { ...empty, modified_at: empty.modified_at + revision },
+            epoch,
+            host: 'repository',
+            protocol: PROTOCOL_VERSION,
+            revision,
+            uri: '/coalesced.txt',
+        });
+    }
+    release_block();
+    await wait_for(() => applied.length === 1);
+    await wait(25);
+
+    assert.deepEqual(applied, [[
+        '/coalesced.txt',
+        empty.modified_at + 101,
+        101,
+    ]]);
+    assert.equal(mirror_record.logs.filter(([code]) => code === 'MANIFEST').length, 1);
+    assert.deepEqual(mirror_record.errors, []);
+    assert.deepEqual(server_record.errors, []);
+});
+
+test('live inbox overflow falls back to bounded authoritative reconciliation', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-overflow-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-overflow-mirror-');
+    const server_record = await create_server(t, server_root);
+    const mirror_record = await create_mirror(t, mirror_root, server_record.port, {
+        queue: { max_concurrent: 2, max_queued: 0, max_pending: 2 },
+    });
+    const original_fetch = globalThis.fetch;
+    const targets = Array.from({ length: 8 }, (_, index) =>
+        `/overflow-${String(index).padStart(2, '0')}.txt`
+    );
+    let release_download;
+    let signal_download;
+    let received = 0;
+    const download_gate = new Promise((resolve) => {
+        release_download = resolve;
+    });
+    const download_started = new Promise((resolve) => {
+        signal_download = resolve;
+    });
+    globalThis.fetch = async (input, options) => {
+        const url = new URL(input);
+        const response = await original_fetch(input, options);
+        if (
+            (options?.method || 'GET') === 'GET' &&
+            url.pathname === `${PROTOCOL_PATH}/content` &&
+            url.searchParams.get('uri') === '/block-overflow.txt'
+        ) {
+            signal_download();
+            await download_gate;
+        }
+        return response;
+    };
+    const receive_mutation = mirror_record.mirror._receive_mutation.bind(mirror_record.mirror);
+    mirror_record.mirror._receive_mutation = (message) => {
+        if (targets.includes(message.uri)) received++;
+        return receive_mutation(message);
+    };
+    t.after(() => {
+        release_download();
+        globalThis.fetch = original_fetch;
+    });
+
+    await write_file(server_root, '/block-overflow.txt', 'block');
+    await download_started;
+    await Promise.all(targets.map((uri, index) =>
+        write_file(server_root, uri, `content-${index}`)
+    ));
+    await wait_for(() => received === targets.length);
+    release_download();
+    await wait_for(async () => {
+        for (let index = 0; index < targets.length; index++)
+            if (
+                (await read_if_exists(Path.join(mirror_root, targets[index]))) !==
+                `content-${index}`
+            ) return false;
+        return true;
+    });
+
+    assert.ok(mirror_record.logs.filter(([code]) => code === 'MANIFEST').length >= 2);
+    assert.deepEqual(mirror_record.errors, []);
+    assert.deepEqual(server_record.errors, []);
+});
+
+test('live Mirror upload bursts use the same bounded reconciliation fallback', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-upload-overflow-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-upload-overflow-mirror-');
+    const server_record = await create_server(t, server_root);
+    const mirror_record = await create_mirror(t, mirror_root, server_record.port, {
+        queue: { max_concurrent: 2, max_queued: 0, max_pending: 2 },
+    });
+    const original_fetch = globalThis.fetch;
+    const targets = Array.from({ length: 8 }, (_, index) =>
+        `/upload-overflow-${String(index).padStart(2, '0')}.txt`
+    );
+    let release_upload;
+    let signal_upload;
+    let received = 0;
+    const upload_gate = new Promise((resolve) => {
+        release_upload = resolve;
+    });
+    const upload_started = new Promise((resolve) => {
+        signal_upload = resolve;
+    });
+    globalThis.fetch = async (input, options) => {
+        const url = new URL(input);
+        if (
+            options?.method === 'PUT' &&
+            url.pathname === `${PROTOCOL_PATH}/content` &&
+            url.searchParams.get('uri') === '/block-upload.txt'
+        ) {
+            signal_upload();
+            await upload_gate;
+        }
+        return original_fetch(input, options);
+    };
+    const handle_local_mutation = mirror_record.mirror._handle_local_mutation
+        .bind(mirror_record.mirror);
+    mirror_record.mirror._handle_local_mutation = (uri, entry) => {
+        if (targets.includes(uri)) received++;
+        return handle_local_mutation(uri, entry);
+    };
+    t.after(() => {
+        release_upload();
+        globalThis.fetch = original_fetch;
+    });
+
+    await write_file(mirror_root, '/block-upload.txt', 'block');
+    await upload_started;
+    await Promise.all(targets.map((uri, index) =>
+        write_file(mirror_root, uri, `upload-${index}`)
+    ));
+    await wait_for(() => received === targets.length);
+    release_upload();
+    await wait_for(async () => {
+        for (let index = 0; index < targets.length; index++)
+            if (
+                (await read_if_exists(Path.join(server_root, targets[index]))) !==
+                `upload-${index}`
+            ) return false;
+        return true;
+    });
+
+    assert.ok(mirror_record.logs.filter(([code]) => code === 'MANIFEST').length >= 2);
+    assert.deepEqual(mirror_record.errors, []);
+    assert.deepEqual(server_record.errors, []);
+});
+
+test('complete reconciliation does not require queued transfer promises', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-bounded-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-bounded-mirror-');
+    const targets = Array.from({ length: 12 }, (_, index) =>
+        `/bounded-${String(index).padStart(2, '0')}.txt`
+    );
+    await Promise.all(targets.map((uri, index) =>
+        write_file(server_root, uri, `bounded-${index}`)
+    ));
+    const server_record = await create_server(t, server_root);
+    const mirror_record = await create_mirror(t, mirror_root, server_record.port, {
+        queue: { max_concurrent: 2, max_queued: 0, max_pending: 2 },
+    });
+
+    for (let index = 0; index < targets.length; index++)
+        assert.equal(
+            await read_if_exists(Path.join(mirror_root, targets[index])),
+            `bounded-${index}`
+        );
+    assert.deepEqual(mirror_record.errors, []);
+    assert.deepEqual(server_record.errors, []);
+    await mirror_record.mirror.destroy();
+    await server_record.server.destroy();
+});
+
+test('live directory mutations remain barriers around descendant file transfers', async (t) => {
+    const server_root = await temporary_directory(t, 'directory-sync-barrier-server-');
+    const mirror_root = await temporary_directory(t, 'directory-sync-barrier-mirror-');
+    const server_record = await create_server(t, server_root);
+    const mirror_record = await create_mirror(t, mirror_root, server_record.port);
+    const original_fetch = globalThis.fetch;
+    let release_download;
+    let signal_download;
+    let signal_tombstone;
+    const download_gate = new Promise((resolve) => {
+        release_download = resolve;
+    });
+    const download_started = new Promise((resolve) => {
+        signal_download = resolve;
+    });
+    const tombstone_received = new Promise((resolve) => {
+        signal_tombstone = resolve;
+    });
+    globalThis.fetch = async (input, options) => {
+        const url = new URL(input);
+        const response = await original_fetch(input, options);
+        if (
+            (options?.method || 'GET') === 'GET' &&
+            url.pathname === `${PROTOCOL_PATH}/content` &&
+            url.searchParams.get('uri') === '/tree/payload.txt'
+        ) {
+            signal_download();
+            await download_gate;
+        }
+        return response;
+    };
+    const receive_mutation = mirror_record.mirror._receive_mutation.bind(mirror_record.mirror);
+    mirror_record.mirror._receive_mutation = (message) => {
+        if (
+            message.uri === '/tree' &&
+            message.entry?.type === 'tombstone' &&
+            message.entry.target === 'directory'
+        ) signal_tombstone();
+        return receive_mutation(message);
+    };
+    t.after(() => {
+        release_download();
+        globalThis.fetch = original_fetch;
+    });
+
+    await write_file(server_root, '/tree/payload.txt', 'payload');
+    await download_started;
+    await FileSystem.rm(Path.join(server_root, 'tree'), { recursive: true, force: true });
+    await tombstone_received;
+    await wait(50);
+    assert.equal((await FileSystem.stat(Path.join(mirror_root, 'tree'))).isDirectory(), true);
+
+    release_download();
+    await wait_for(async () => {
+        try {
+            await FileSystem.stat(Path.join(mirror_root, 'tree'));
+            return false;
+        } catch (error) {
+            if (error.code === 'ENOENT') return true;
+            throw error;
+        }
+    });
+    assert.deepEqual(mirror_record.errors, []);
+    assert.deepEqual(server_record.errors, []);
+});
+
 test('server rejects malformed, oversized, stale, and filtered mutations', async (t) => {
     const root = await temporary_directory(t);
     await write_file(root, '/current.txt', 'central', Date.now());
@@ -337,6 +679,13 @@ test('Mirror drops authority-filtered paths before transfers or logs', async (t)
         filters: { ignore: { directories: ['blocked'] } },
     });
 
+    const original_fetch = globalThis.fetch;
+    const requested_uris = [];
+    globalThis.fetch = (input, options) => {
+        requested_uris.push(new URL(input).searchParams.get('uri'));
+        return original_fetch(input, options);
+    };
+    t.after(() => { globalThis.fetch = original_fetch; });
     const { errors, logs, mirror } = await create_mirror(t, mirror_root, port);
     assert.equal(await read_if_exists(Path.join(server_root, 'allowed.txt')), 'allowed');
     assert.equal(await read_if_exists(Path.join(mirror_root, 'download.txt')), 'download');
@@ -354,12 +703,6 @@ test('Mirror drops authority-filtered paths before transfers or logs', async (t)
         code === 'DOWNLOAD' && message.startsWith('/download.txt - FILE - COMPLETE - ')
     ), true);
     assert.equal(logs.some(([code, message]) =>
-        code === 'MANIFEST' && /^repository - SYNC COMPLETE - \d+ms$/.test(message)
-    ), true);
-    assert.equal(logs.some(([code, message]) =>
-        code === 'CREATE' && /^\/download\.txt - FILE - \d+ms$/.test(message)
-    ), true);
-    assert.equal(logs.some(([code, message]) =>
         code === 'FILTERED' || message.startsWith('/blocked')
     ), false);
     await write_file(mirror_root, '/nested/blocked/live.txt', 'blocked');
@@ -367,8 +710,9 @@ test('Mirror drops authority-filtered paths before transfers or logs', async (t)
     assert.equal(mirror.map.get_entry('/nested/blocked/live.txt'), undefined);
     assert.equal(await read_if_exists(Path.join(server_root, 'nested/blocked/live.txt')), undefined);
     assert.equal(logs.some(([, message]) => message.includes('/nested/blocked/live.txt')), false);
+    assert.equal(requested_uris.some((uri) => uri?.includes('/blocked')), false);
     assert.equal(logs.every(([code]) =>
-        ['UPLOAD', 'DOWNLOAD', 'CREATE', 'DELETE', 'MANIFEST', 'WEBSOCKET', 'SIZE_LIMIT_REACHED', 'TOMBSTONE_EVICTED'].includes(code)
+        ['UPLOAD', 'DOWNLOAD', 'MANIFEST', 'WEBSOCKET'].includes(code)
     ), true);
     assert.deepEqual(errors, []);
     assert.deepEqual(server_errors, []);
@@ -462,15 +806,6 @@ test('server authority converges two mirrors with newest-mtime conflict resoluti
         second_errors: second_record.errors.map((error) => error.message),
     }) });
     assert.equal(server_record.server.hosts.repository.map.manifest['/shared.txt'], undefined);
-    assert.equal(first_record.logs.some(([code, message]) =>
-        code === 'DELETE' && /^\/shared\.txt - FILE - \d+ms$/.test(message)
-    ), true);
-    assert.equal(server_record.logs.some(([code, message]) =>
-        code === 'DELETE' && /'repository' - \/shared\.txt - FILE - \d+ms$/.test(message)
-    ), true);
-    assert.equal(second_record.logs.some(([code, message]) =>
-        code === 'DELETE' && /^\/shared\.txt - FILE - \d+ms$/.test(message)
-    ), true);
 
     const deletion = server_record.server.hosts.repository.map.get_tombstone('/shared.txt');
     assert.equal(deletion.type, 'tombstone');
@@ -560,55 +895,6 @@ test('zero-byte files and directory/file transitions converge across mirrors', a
         server_errors: server_record.errors.map((error) => error.message),
         mirror_errors: mirror_record.errors.map((error) => error.message),
     }) });
-    assert.deepEqual(server_record.errors, []);
-    assert.deepEqual(mirror_record.errors, []);
-});
-
-test('recursive directory deletion emits one parent DELETE log per destination', async (t) => {
-    const server_root = await temporary_directory(t, 'directory-sync-delete-server-');
-    const mirror_root = await temporary_directory(t, 'directory-sync-delete-mirror-');
-    await write_file(server_root, '/tree/nested/child.txt', 'child');
-    const server_record = await create_server(t, server_root);
-    const mirror_record = await create_mirror(t, mirror_root, server_record.port);
-    await wait_for(async () =>
-        (await read_if_exists(Path.join(mirror_root, 'tree/nested/child.txt'))) === 'child'
-    );
-    const server_log_index = server_record.logs.length;
-    const mirror_log_index = mirror_record.logs.length;
-
-    const response = await fetch(
-        endpoint(server_record.port, `${PROTOCOL_PATH}/entry`, 'repository', '/tree'),
-        {
-            method: 'DELETE',
-            headers: { ...headers(), 'content-type': 'application/json' },
-            body: JSON.stringify({
-                type: 'tombstone',
-                target: 'directory',
-                deleted_at: Date.now() + 1_000,
-                include_self: true,
-            }),
-        }
-    );
-    assert.equal(response.status, 200);
-    await response.json();
-    await wait_for(async () =>
-        (await read_if_exists(Path.join(mirror_root, 'tree'))) === undefined
-    );
-
-    const server_logs = server_record.logs.slice(server_log_index);
-    const mirror_logs = mirror_record.logs.slice(mirror_log_index);
-    assert.equal(server_logs.some(([code, message]) =>
-        code === 'DELETE' && /'repository' - \/tree - DIRECTORY - \d+ms$/.test(message)
-    ), true);
-    assert.equal(mirror_logs.some(([code, message]) =>
-        code === 'DELETE' && /^\/tree - DIRECTORY - \d+ms$/.test(message)
-    ), true);
-    assert.equal(server_logs.some(([code, message]) =>
-        code === 'DELETE' && message.includes('/tree/')
-    ), false);
-    assert.equal(mirror_logs.some(([code, message]) =>
-        code === 'DELETE' && message.includes('/tree/')
-    ), false);
     assert.deepEqual(server_record.errors, []);
     assert.deepEqual(mirror_record.errors, []);
 });

@@ -195,6 +195,8 @@ export interface MirrorOptions extends DirectoryMapOptions {
         /** Maximum active file transfers. Defaults to 100. */
         max_concurrent?: number;
         max_queued?: number;
+        /** Maximum distinct pending live mutations before falling back to manifest reconciliation. Defaults to 10,000. */
+        max_pending?: number;
         timeout?: number;
         throttle?: { rate?: number; interval?: number };
     };

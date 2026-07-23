@@ -37,6 +37,7 @@ const mirror_options: MirrorOptions = {
     queue: {
         max_concurrent: 4,
         max_queued: 100,
+        max_pending: 1_000,
         throttle: { rate: 20, interval: 1000 },
     },
 };
